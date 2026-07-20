@@ -43,7 +43,12 @@ WEEK_FLOOR_IMPRESSIONS = 30
 MIN_WEEKS_WITH_FLOOR = 3
 
 # --- Gatilho 1: vazamento de CTR ---
-G1_MIN_IMPRESSIONS = 500
+G1_MIN_IMPRESSIONS = 150   # PROVISORIO: o piso original de 500 nunca foi
+# atingido por nenhuma query comercial na primeira execucao real (0 de 1642
+# passaram, confirmado pelo diagnostico de funil). 150 e um chute mais
+# conservador para nao ficar zerado de novo - a proxima execucao imprime a
+# distribuicao real (mediana, p75, p90, p95, p99) para calibrar com dado
+# em vez de outro chute.
 G1_MAX_POSITION = 8
 G1_CTR_ABSOLUTE_FLOOR = 0.01     # 1%
 G1_CTR_DROP_RATIO = 0.40         # queda de 40% vs media
@@ -84,7 +89,8 @@ BRAND_PATTERNS = [
 ]
 G7_MIN_AVG_IMPRESSIONS = 20
 G7_DROP_RATIO = 0.30
-G7_POSITION_DROP_ALERT = 2.0
+G7_POSITION_DROP_ALERT = 4.0
+G7_MAX_MEANINGFUL_POSITION = 20   # abaixo do top 20 a posicao e ruido, nao alerta
 
 # ===========================================================================
 # CLASSIFICADOR DE QUERY COMERCIAL/LOCAL
@@ -187,6 +193,35 @@ def get_gsc_service():
     return build("searchconsole", "v1", credentials=creds)
 
 
+def is_garbage_query(query):
+    """
+    Queries que carregam uma URL dentro do texto nao representam busca
+    humana real - sao ruido de bot, scraper, ou alguem colando conteudo
+    errado na caixa de busca do Google. Isso importa porque um \\b (limite
+    de palavra) no regex de marca trata '/' e '.' como limite, entao
+    'https://turfresh.com/...' bate em '\\bturfresh\\b' mesmo nao sendo uma
+    busca de marca de verdade - foi assim que uma query lixo contaminou o
+    Gatilho 7. Filtrar aqui, uma vez, antes de qualquer classificador rodar,
+    em vez de remendar cada regex separadamente.
+    """
+    q = str(query)
+    if re.search(r"https?://|www\.", q, re.IGNORECASE):
+        return True
+    if len(q) > 100:   # buscas reais raramente passam disso
+        return True
+    return False
+
+
+def filter_garbage_queries(df):
+    if df.empty:
+        return df
+    mask = ~df["query"].apply(is_garbage_query)
+    removed = (~mask).sum()
+    if removed:
+        print(f"  ({removed} queries-lixo removidas - continham URL ou eram anormalmente longas)")
+    return df[mask].reset_index(drop=True)
+
+
 def fetch_week(service, start_date, end_date):
     """Uma semana de dados query+page. Pagina se precisar."""
     rows_out, start_row = [], 0
@@ -203,7 +238,7 @@ def fetch_week(service, start_date, end_date):
         if len(rows) < 25000:
             break
         start_row += 25000
-    return pd.DataFrame(rows_out)
+    return filter_garbage_queries(pd.DataFrame(rows_out))
 
 
 def fetch_trailing_weeks(service, n_weeks=N_TRAILING_WEEKS):
@@ -691,8 +726,13 @@ def gatilho_7_marca(current_df, trailing_stats):
         impr = float(r["impressions"])
         pos = float(r["position"])
 
-        # B) posicao caindo - prioridade maxima, sem exigir piso de volume
-        if st["media_position"] is not None:
+        # B) posicao caindo - grave, mas so se a confianca for real. Sem
+        # isso, qualquer variante de marca de cauda longa com 2-3 impressoes
+        # (posicao naturalmente ruidosa) disparava "urgente" por oscilacao
+        # normal, e query em posicao 90+ (invisivel) alertava mesmo sem
+        # significado operacional nenhum.
+        if (st["confiavel"] and st["media_position"] is not None
+                and st["media_position"] <= G7_MAX_MEANINGFUL_POSITION):
             pos_drop = pos - st["media_position"]
             if pos_drop >= G7_POSITION_DROP_ALERT:
                 alerts.append({
@@ -816,6 +856,19 @@ def print_funnel_diagnostic(current_df):
         print("\n  ALERTA: regex comercial/local nao capturou nenhuma query.")
     if brand.empty:
         print("\n  ALERTA: regex de marca nao capturou nenhuma query - confirmar variacoes do nome.")
+
+    # Distribuicao real de impressoes entre queries comerciais - para
+    # calibrar G1_MIN_IMPRESSIONS com evidencia, nao com outro chute.
+    if n_comm > 0:
+        impr_por_query = comm.groupby("query")["impressions"].sum()
+        pcts = impr_por_query.quantile([0.5, 0.75, 0.90, 0.95, 0.99])
+        print(f"\n  Distribuicao de impressoes/semana entre as {n_comm} queries comerciais:")
+        print(f"    mediana: {pcts[0.5]:.0f}  |  p75: {pcts[0.75]:.0f}  |  "
+              f"p90: {pcts[0.90]:.0f}  |  p95: {pcts[0.95]:.0f}  |  p99: {pcts[0.99]:.0f}")
+        if n_comm_impr == 0 and pcts[0.99] < G1_MIN_IMPRESSIONS:
+            print(f"    O piso de {G1_MIN_IMPRESSIONS} esta acima do p99 - nenhuma query")
+            print(f"    individual vai bater isso numa semana so. Considerar baixar para")
+            print(f"    perto do p90 ({pcts[0.90]:.0f}) na proxima calibracao.")
     print()
 
 
@@ -928,31 +981,119 @@ GMAIL_USER = os.environ.get("GMAIL_USER")
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
 ALERT_EMAIL_TO = os.environ.get("ALERT_EMAIL_TO")
 
+MAX_ITEMS_PER_SECTION = 8   # o e-mail mostra o topo; a planilha tem a lista inteira
+
+GATILHO_INFO = [
+    ("g1", "Vazamento de CTR", "#FCE4D6"),
+    ("g2", "Queda de impressoes precoce", "#FFF2CC"),
+    ("g3", "Query nova emergindo", "#DDEEFF"),
+    ("g4", "Decaimento de posts otimizados", "#FCE4D6"),
+    ("g5", "Sinal de vida de conteudo novo", "#DDEEFF"),
+    ("g6", "City pages (subindo/caindo)", "#FFF2CC"),
+    ("g7", "Trafego de marca", "#FFF2CC"),
+]
+
+
+def _html_escape(s):
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def _build_html_email(data, run_date, total, marca_maxima):
+    """
+    Estrutura visual: caixa vermelha de urgencia no topo (se houver), depois
+    um resumo em grade com contagem por gatilho, depois cada gatilho que tem
+    alerta vira uma secao com no maximo MAX_ITEMS_PER_SECTION linhas - o
+    resto fica so na planilha anexa, para o e-mail nao virar parede de texto.
+    """
+    css_box = ("border-radius:8px;padding:16px 20px;margin-bottom:16px;"
+               "font-family:Arial,Helvetica,sans-serif;")
+    css_table = ("width:100%;border-collapse:collapse;margin-bottom:20px;"
+                "font-family:Arial,Helvetica,sans-serif;font-size:13px;")
+
+    html = [f'<div style="font-family:Arial,Helvetica,sans-serif;max-width:720px;">']
+    html.append(f'<h2 style="color:#1F3864;margin-bottom:4px;">TurFresh - Alertas Semanais</h2>')
+    html.append(f'<p style="color:#666;margin-top:0;">{run_date.isoformat()}</p>')
+
+    if marca_maxima:
+        html.append(f'<div style="{css_box}background:#FFEBEE;border:2px solid #D32F2F;">')
+        html.append('<strong style="color:#D32F2F;font-size:15px;">⚠ URGENTE - Posicao de marca caindo</strong>')
+        html.append('<ul style="margin:8px 0 0 0;padding-left:20px;">')
+        for a in marca_maxima[:MAX_ITEMS_PER_SECTION]:
+            html.append(f'<li><b>{_html_escape(a["query"])}</b>: posicao '
+                        f'{a["posicao_media_4sem"]} → {a["posicao"]} '
+                        f'<span style="color:#888;">({_html_escape(a["pagina"])})</span></li>')
+        if len(marca_maxima) > MAX_ITEMS_PER_SECTION:
+            html.append(f'<li><i>+{len(marca_maxima)-MAX_ITEMS_PER_SECTION} outras na planilha</i></li>')
+        html.append('</ul></div>')
+
+    # resumo em grade
+    html.append(f'<table style="{css_table}"><tr>')
+    html.append('<td colspan="2" style="background:#1F3864;color:white;padding:8px 12px;'
+                'font-weight:bold;">Resumo</td></tr>')
+    for key, label, color in GATILHO_INFO:
+        n = len(data[key])
+        bg = color if n > 0 else "#F5F5F5"
+        html.append(f'<tr><td style="padding:6px 12px;border-bottom:1px solid #eee;'
+                    f'background:{bg};">{label}</td>'
+                    f'<td style="padding:6px 12px;border-bottom:1px solid #eee;'
+                    f'background:{bg};text-align:right;font-weight:bold;">{n}</td></tr>')
+    html.append(f'<tr><td style="padding:8px 12px;font-weight:bold;">Total</td>'
+               f'<td style="padding:8px 12px;text-align:right;font-weight:bold;">{total}</td></tr>')
+    html.append('</table>')
+
+    # secoes detalhadas (so as que tem alerta, so o topo)
+    section_renderers = {
+        "g1": lambda a: f'<b>{_html_escape(a["query"])}</b> - CTR {a["ctr_semana"]} '
+                        f'(pos {a["posicao"]}, {a["impressoes_semana"]:,} impr)',
+        "g2": lambda a: f'<b>{_html_escape(a["query"])}</b> - impressoes cairam {a["queda_pct"]}',
+        "g3": lambda a: f'<b>{_html_escape(a["query"])}</b> - {a["impressoes_semana"]} impr '
+                        f'({a.get("tipo","")})',
+        "g4": lambda a: f'<b>{_html_escape(a["pagina"])}</b> - clicks cairam {a["queda_pct"]}',
+        "g5": lambda a: f'<b>{_html_escape(a["pagina"])}</b> - {a["motivo"]}',
+        "g6": lambda a: f'<b>{_html_escape(a["pagina"])}</b> - {a["gatilho"].replace("6. ","")}',
+        "g7": lambda a: f'<b>{_html_escape(a["query"])}</b> - {a["gatilho"].replace("7. Marca - ","")}',
+    }
+    for key, label, color in GATILHO_INFO:
+        rows = data[key]
+        if not rows:
+            continue
+        html.append(f'<div style="{css_box}background:{color};">')
+        html.append(f'<strong>{label} ({len(rows)})</strong>')
+        html.append('<ul style="margin:8px 0 0 0;padding-left:20px;">')
+        for a in rows[:MAX_ITEMS_PER_SECTION]:
+            html.append(f'<li>{section_renderers[key](a)}</li>')
+        if len(rows) > MAX_ITEMS_PER_SECTION:
+            html.append(f'<li><i>+{len(rows)-MAX_ITEMS_PER_SECTION} outras na planilha anexa</i></li>')
+        html.append('</ul></div>')
+
+    html.append('<p style="color:#666;font-size:12px;">Detalhe completo, com evidencia e '
+               'motivo de cada alerta, na planilha anexa.</p>')
+    html.append('</div>')
+    return "\n".join(html)
+
 
 def send_email(g1, g2, g3, g4, g5, g6, g7, report_path, run_date):
     import smtplib
     from email.message import EmailMessage
 
-    total = len(g1) + len(g2) + len(g3) + len(g4) + len(g5) + len(g6) + len(g7)
+    data = {"g1": g1, "g2": g2, "g3": g3, "g4": g4, "g5": g5, "g6": g6, "g7": g7}
+    total = sum(len(v) for v in data.values())
     marca_maxima = [a for a in g7 if a.get("urgencia") == "MAXIMA"]
 
-    body = [f"TurFresh - Alertas Semanais - {run_date.isoformat()}", "=" * 55, ""]
+    # fallback em texto puro, para clientes de email sem suporte a HTML
+    text_lines = [f"TurFresh - Alertas Semanais - {run_date.isoformat()}", "=" * 55, ""]
     if marca_maxima:
-        body.append("!!! URGENTE - POSICAO DE MARCA CAINDO !!!")
-        for a in marca_maxima:
-            body.append(f"  {a['query']}: {a['motivo']}")
-        body.append("")
+        text_lines.append("URGENTE - POSICAO DE MARCA CAINDO:")
+        for a in marca_maxima[:MAX_ITEMS_PER_SECTION]:
+            text_lines.append(f"  {a['query']}: {a['posicao_media_4sem']} -> {a['posicao']}")
+        text_lines.append("")
+    text_lines.append(f"Total: {total} alertas")
+    for key, label, _ in GATILHO_INFO:
+        text_lines.append(f"  {label}: {len(data[key])}")
+    text_lines.append("\nDetalhe completo na planilha anexa.")
+    text = "\n".join(text_lines)
 
-    body.append(f"Total: {total} alertas")
-    body.append(f"  G1 vazamento CTR: {len(g1)}")
-    body.append(f"  G2 queda precoce: {len(g2)}")
-    body.append(f"  G3 query nova: {len(g3)}")
-    body.append(f"  G4 decaimento posts: {len(g4)}")
-    body.append(f"  G5 sinal de vida: {len(g5)}")
-    body.append(f"  G6 city pages: {len(g6)}")
-    body.append(f"  G7 marca: {len(g7)}")
-    body.append("\nDetalhe completo na planilha anexa.")
-    text = "\n".join(body)
+    html = _build_html_email(data, run_date, total, marca_maxima)
 
     if not (GMAIL_USER and GMAIL_APP_PASSWORD and ALERT_EMAIL_TO):
         print(text)
@@ -964,6 +1105,7 @@ def send_email(g1, g2, g3, g4, g5, g6, g7, report_path, run_date):
     msg["From"] = GMAIL_USER
     msg["To"] = ALERT_EMAIL_TO
     msg.set_content(text)
+    msg.add_alternative(html, subtype="html")
     with open(report_path, "rb") as f:
         msg.add_attachment(f.read(), maintype="application",
                            subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -971,12 +1113,13 @@ def send_email(g1, g2, g3, g4, g5, g6, g7, report_path, run_date):
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
         s.login(GMAIL_USER, GMAIL_APP_PASSWORD)
         s.send_message(msg)
-    print("Email enviado.")
+    print("Email enviado (HTML).")
     print(text)
 
 
 # ===========================================================================
 # MAIN
+
 # ===========================================================================
 def main():
     run_date = date.today()
