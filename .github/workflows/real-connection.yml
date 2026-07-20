@@ -3,7 +3,7 @@ name: Weekly TurFresh Alert
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "0 13 * * 1"   # segunda-feira 13:00 UTC
+    - cron: "0 13 * * 1"
 
 jobs:
   alert:
@@ -28,4 +28,5 @@ jobs:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+          GA4_PROPERTY_ID: ${{ secrets.GA4_PROPERTY_ID }}
         run: python scripts/turfresh_alert.py
