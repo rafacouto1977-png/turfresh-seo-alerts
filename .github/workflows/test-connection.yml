@@ -1,10 +1,12 @@
-name: Test Connection
+name: Weekly TurFresh Alert
 
 on:
   workflow_dispatch: {}
+  schedule:
+    - cron: "0 13 * * 1"   # segunda-feira 13:00 UTC
 
 jobs:
-  test:
+  alert:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
@@ -18,9 +20,12 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run connection test
+      - name: Run weekly alert
         env:
           SITE_URL: ${{ secrets.SITE_URL }}
           GSC_CLIENT_EMAIL: ${{ secrets.GSC_CLIENT_EMAIL }}
           GSC_PRIVATE_KEY: ${{ secrets.GSC_PRIVATE_KEY }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
         run: python scripts/turfresh_alert.py
