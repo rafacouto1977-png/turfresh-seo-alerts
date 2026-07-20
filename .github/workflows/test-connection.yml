@@ -23,4 +23,4 @@ jobs:
           SITE_URL: ${{ secrets.SITE_URL }}
           GSC_CLIENT_EMAIL: ${{ secrets.GSC_CLIENT_EMAIL }}
           GSC_PRIVATE_KEY: ${{ secrets.GSC_PRIVATE_KEY }}
-        run: python scripts/test_connection.py
+        run: python scripts/test_alert.py
