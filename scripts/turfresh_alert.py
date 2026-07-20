@@ -22,6 +22,9 @@ from datetime import date, timedelta
 import pandas as pd
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
 
 # ===========================================================================
 # CONFIG
@@ -44,6 +47,44 @@ G1_MIN_IMPRESSIONS = 500
 G1_MAX_POSITION = 8
 G1_CTR_ABSOLUTE_FLOOR = 0.01     # 1%
 G1_CTR_DROP_RATIO = 0.40         # queda de 40% vs media
+
+# --- Gatilho 2: queda de impressoes precoce ---
+G2_TOP_N_PAGES = 20
+G2_DROP_RATIO = 0.30
+G2_MIN_AVG_IMPRESSIONS = 300
+G2_MAX_POSITION_VARIATION = 2.0
+
+# --- Gatilho 3: query nova emergindo ---
+G3_MIN_IMPRESSIONS = 100
+G3_MIN_IMPRESSIONS_QUESTION = 50
+QUESTION_PATTERNS = [r"^how\b", r"^what\b", r"^why\b", r"^is\b", r"^can\b", r"^does\b",
+                    r"^do\b", r"^are\b", r"^will\b", r"^should\b"]
+
+# --- Gatilho 4: decaimento dos posts otimizados ---
+G4_DROP_RATIO = 0.30
+G4_MIN_AVG_CLICKS = 20
+SEO_LOG_PATH = "data/seo_log_urls.csv"
+
+# --- Gatilho 5: sinal de vida do conteudo novo ---
+G5_POSITIVE_MIN_IMPRESSIONS = 50
+G5_NEGATIVE_MIN_DAYS = 21
+CITY_PAGES_PATH = "data/city_pages.csv"
+
+# --- Gatilho 6: city pages radar ---
+G6_NEW_PAGE_THRESHOLD = 20         # abaixo disso, pagina e tratada como nova/pequena
+G6_RISE_FIRST_SIGNAL = 20         # primeira vez que bate isso = "comecou a rankear"
+G6_RISE_RATIO = 0.25              # pagina estabelecida: sobe 25%+
+G6_FALL_RATIO = 0.25
+G6_FALL_MIN_AVG = 20
+CITY_PAGE_URL_PATTERN = r"^/(?:arizona|california|nevada|florida|texas)/[a-z-]+/$"
+
+# --- Gatilho 7: trafego de marca ---
+BRAND_PATTERNS = [
+    r"\bturfresh\b", r"\bturf\s*fresh\b", r"\btur\s*fresh\b", r"\bturffresh\b",
+]
+G7_MIN_AVG_IMPRESSIONS = 20
+G7_DROP_RATIO = 0.30
+G7_POSITION_DROP_ALERT = 2.0
 
 # ===========================================================================
 # CLASSIFICADOR DE QUERY COMERCIAL/LOCAL
@@ -78,6 +119,58 @@ def is_commercial_local(query):
     if any(re.search(p, q) for p in DIY_PATTERNS):
         return False
     return any(re.search(p, q) for p in COMMERCIAL_LOCAL_PATTERNS)
+
+
+def is_brand(query):
+    q = query.lower()
+    return any(re.search(p, q) for p in BRAND_PATTERNS)
+
+
+def is_question(query):
+    q = query.lower().strip()
+    return any(re.search(p, q) for p in QUESTION_PATTERNS)
+
+
+def norm_path(url):
+    p = re.sub(r"^https?://[^/]+", "", str(url)).split("?")[0].split("#")[0]
+    if not p:
+        p = "/"
+    if len(p) > 1 and not p.endswith("/"):
+        p += "/"
+    return p.lower()
+
+
+def load_seo_log_urls():
+    """As 69 URLs vivas do SEO Log (as 44 redirecionadas ja foram excluidas
+    na extracao). Retorna dict path -> data_otimizacao (string, pode ser vazia)."""
+    if not os.path.exists(SEO_LOG_PATH):
+        print(f"  Aviso: {SEO_LOG_PATH} nao encontrado. Gatilho 4 fica vazio.")
+        return {}
+    out = {}
+    with open(SEO_LOG_PATH, newline="", encoding="utf-8") as f:
+        import csv
+        for row in csv.DictReader(f):
+            path = norm_path(row["path"])
+            out[path] = row.get("data_otimizacao", "")
+    print(f"  SEO Log: {len(out)} URLs vivas carregadas")
+    return out
+
+
+def load_city_pages():
+    """As 35 city pages (21 prioritarias + 14 novas). Retorna dict
+    path -> {categoria, data_publicacao}."""
+    if not os.path.exists(CITY_PAGES_PATH):
+        print(f"  Aviso: {CITY_PAGES_PATH} nao encontrado. Gatilhos 5/6 ficam vazios.")
+        return {}
+    out = {}
+    with open(CITY_PAGES_PATH, newline="", encoding="utf-8") as f:
+        import csv
+        for row in csv.DictReader(f):
+            path = norm_path(row["path"])
+            out[path] = {"categoria": row.get("categoria", ""),
+                        "data_publicacao": row.get("data_publicacao", "")}
+    print(f"  City pages: {len(out)} paginas carregadas")
+    return out
 
 
 # ===========================================================================
@@ -266,9 +359,627 @@ def gatilho_1_vazamento_ctr(current_df, trailing_stats):
 
 
 # ===========================================================================
+# GATILHO 2 - QUEDA DE IMPRESSOES PRECOCE
+# ===========================================================================
+def gatilho_2_queda_precoce(current_df, trailing_stats):
+    """
+    Top 20 paginas + queries comerciais. Dispara quando impressoes cairam
+    >=30% vs media_4sem (media confiavel, piso 300/sem) E posicao ficou
+    estavel (variacao < 2). Posicao estavel + impressao caindo = Google
+    mostrando menos, nao voce piorando (AI Overview, perda de feature).
+    """
+    alerts = []
+    if current_df.empty:
+        return alerts
+
+    page_impr = current_df.groupby("page")["impressions"].sum().sort_values(ascending=False)
+    top_pages = set(page_impr.head(G2_TOP_N_PAGES).index)
+    money_queries = set(current_df[current_df["query"].apply(is_commercial_local)]["query"])
+
+    for _, r in current_df.iterrows():
+        query, page = r["query"], r["page"]
+        if page not in top_pages and query not in money_queries:
+            continue
+
+        k = (query, page)
+        st = trailing_stats.get(k)
+        if not st or not st["confiavel"] or st["media_impr"] < G2_MIN_AVG_IMPRESSIONS:
+            continue
+
+        impr = float(r["impressions"])
+        pos = float(r["position"])
+        drop = (st["media_impr"] - impr) / st["media_impr"]
+        if drop < G2_DROP_RATIO:
+            continue
+
+        pos_variation = abs(pos - st["media_position"]) if st["media_position"] else 999
+        if pos_variation >= G2_MAX_POSITION_VARIATION:
+            continue   # posicao tambem mudou - nao e o padrao "Google mostrando menos"
+
+        alerts.append({
+            "gatilho": "2. Queda de impressoes precoce",
+            "query": query, "pagina": page, "posicao": round(pos, 1),
+            "posicao_media_4sem": round(st["media_position"], 1),
+            "impressoes_semana": int(impr),
+            "media_impr_4sem": round(st["media_impr"], 0),
+            "queda_pct": f"{drop*100:.0f}%",
+            "motivo": (f"Impressoes cairam {drop*100:.0f}% vs media (posicao ficou "
+                      f"estavel: {pos:.1f} vs media {st['media_position']:.1f}). "
+                      f"Google esta mostrando menos essa pagina/query, nao um "
+                      f"problema de ranking."),
+            "confianca": "ALTA",
+        })
+
+    alerts.sort(key=lambda x: -x["impressoes_semana"])
+    return alerts
+
+
+# ===========================================================================
+# GATILHO 3 - QUERY NOVA EMERGINDO
+# ===========================================================================
+def gatilho_3_query_nova(current_df, trailing_stats):
+    """
+    Query ausente nas 4 semanas anteriores E impressoes_semana >= 100.
+    Piso cai para 50 se for pergunta (candidata a calendario de AI).
+    """
+    alerts = []
+    if current_df.empty:
+        return alerts
+
+    seen_queries = current_df.groupby("query")["impressions"].sum()
+    for query, impr in seen_queries.items():
+        # ja apareceu em alguma semana anterior para QUALQUER pagina?
+        already_seen = any(st["esteve_presente"] for k, st in trailing_stats.items()
+                           if k[0] == query)
+        if already_seen:
+            continue
+
+        pergunta = is_question(query)
+        piso = G3_MIN_IMPRESSIONS_QUESTION if pergunta else G3_MIN_IMPRESSIONS
+        if impr < piso:
+            continue
+
+        page = current_df[current_df["query"] == query].iloc[0]["page"]
+        pos = current_df[current_df["query"] == query].iloc[0]["position"]
+
+        alerts.append({
+            "gatilho": "3. Query nova emergindo",
+            "query": query, "pagina": page, "posicao": round(float(pos), 1),
+            "impressoes_semana": int(impr),
+            "tipo": "PERGUNTA - candidata a calendario AI" if pergunta else "comum",
+            "motivo": (f"Query nao existia nas 4 semanas anteriores. "
+                      f"{'E uma pergunta, boa candidata a conteudo de AI Overview.' if pergunta else ''}"),
+            "confianca": "ALTA" if impr >= 200 else "MEDIA",
+        })
+
+    alerts.sort(key=lambda x: -x["impressoes_semana"])
+    return alerts
+
+
+# ===========================================================================
+# GATILHO 4 - DECAIMENTO DOS POSTS OTIMIZADOS
+# ===========================================================================
+def gatilho_4_decaimento_posts(current_df, trailing_stats, seo_log_urls):
+    """
+    Escopo: as 69 URLs vivas do SEO Log (as 44 redirecionadas ja foram
+    excluidas na extracao dos dados). Clicks cairam >=30% vs media_4sem,
+    com piso de 20 clicks/sem para nao alertar ruido de posts pequenos.
+    """
+    alerts = []
+    if current_df.empty or not seo_log_urls:
+        return alerts
+
+    current_df = current_df.copy()
+    current_df["path"] = current_df["page"].apply(norm_path)
+    scoped = current_df[current_df["path"].isin(seo_log_urls.keys())]
+
+    page_clicks = scoped.groupby("path")["clicks"].sum()
+    page_impr = scoped.groupby("path")["impressions"].sum()
+    page_pos = scoped.groupby("path")["position"].mean()
+
+    # agrega trailing_stats por pagina (nao por query+pagina)
+    page_trailing = defaultdict(lambda: {"clicks": [0.0]*N_TRAILING_WEEKS})
+    for (query, page), st in trailing_stats.items():
+        path = norm_path(page)
+        if path in seo_log_urls:
+            # aproximacao: soma media_clicks de todas as queries dessa pagina
+            page_trailing[path]["clicks"] = [
+                page_trailing[path]["clicks"][0] + st["media_clicks"]]
+
+    for path in page_clicks.index:
+        media_clicks = page_trailing.get(path, {}).get("clicks", [0])[0]
+        if media_clicks < G4_MIN_AVG_CLICKS:
+            continue
+        clicks_now = float(page_clicks[path])
+        drop = (media_clicks - clicks_now) / media_clicks if media_clicks else 0
+        if drop < G4_DROP_RATIO:
+            continue
+
+        alerts.append({
+            "gatilho": "4. Decaimento posts otimizados",
+            "pagina": path,
+            "clicks_semana": int(clicks_now),
+            "media_clicks_4sem": round(media_clicks, 1),
+            "impressoes_semana": int(page_impr.get(path, 0)),
+            "posicao": round(float(page_pos.get(path, 0)), 1),
+            "queda_pct": f"{drop*100:.0f}%",
+            "data_otimizacao": seo_log_urls.get(path, ""),
+            "motivo": f"Clicks cairam {drop*100:.0f}% vs a media das 4 semanas anteriores.",
+            "confianca": "ALTA" if media_clicks >= 40 else "MEDIA",
+        })
+
+    alerts.sort(key=lambda x: -x["media_clicks_4sem"])
+    return alerts
+
+
+# ===========================================================================
+# GATILHO 5 - SINAL DE VIDA DO CONTEUDO NOVO
+# ===========================================================================
+def gatilho_5_sinal_vida(current_df, city_pages, run_date):
+    """
+    Escopo: city pages com data de publicacao conhecida, publicadas nos
+    ultimos ~35 dias (folga sobre os 30 para nao perder o corte por causa
+    do lag de dados do GSC).
+    Positivo: primeira semana com impressoes >= 50.
+    Negativo: publicada ha >= 21 dias E impressoes = 0 (problema de indexacao).
+    """
+    alerts = []
+    if current_df.empty or not city_pages:
+        return alerts
+
+    current_df = current_df.copy()
+    current_df["path"] = current_df["page"].apply(norm_path)
+    page_impr = current_df.groupby("path")["impressions"].sum()
+
+    for path, meta in city_pages.items():
+        data_pub_str = meta.get("data_publicacao", "")
+        if not data_pub_str or "verificar" in data_pub_str.lower():
+            continue   # sem data confiavel, nao da para avaliar "sinal de vida"
+
+        dt = _parse_date_flex(data_pub_str)
+        if dt is None:
+            continue
+
+        dias_desde_publicacao = (run_date - dt).days
+        if dias_desde_publicacao < 0 or dias_desde_publicacao > 35:
+            continue
+
+        impr = float(page_impr.get(path, 0))
+
+        if dias_desde_publicacao <= 7 and impr >= G5_POSITIVE_MIN_IMPRESSIONS:
+            alerts.append({
+                "gatilho": "5. Sinal de vida (positivo)",
+                "pagina": path, "dias_desde_publicacao": dias_desde_publicacao,
+                "impressoes_semana": int(impr),
+                "motivo": f"Primeira semana com {int(impr)} impressoes - Google comecou a testar a pagina.",
+                "confianca": "ALTA",
+            })
+        elif dias_desde_publicacao >= G5_NEGATIVE_MIN_DAYS and impr == 0:
+            alerts.append({
+                "gatilho": "5. Sinal de vida (negativo)",
+                "pagina": path, "dias_desde_publicacao": dias_desde_publicacao,
+                "impressoes_semana": 0,
+                "motivo": (f"Publicada ha {dias_desde_publicacao} dias, ZERO impressoes. "
+                          f"Possivel problema de indexacao - checar no GSC (Inspecao de URL)."),
+                "confianca": "ALTA",
+            })
+
+    return alerts
+
+
+def _parse_date_flex(s):
+    """Datas no SEO Log vem em formatos inconsistentes (07 Mai, 10 Jul 2026,
+    Verificar). Tenta alguns formatos comuns em portugues; devolve None se
+    nao conseguir, para o chamador decidir pular em vez de quebrar."""
+    s = str(s).strip()
+    meses = {"jan":1,"fev":2,"mar":3,"abr":4,"mai":5,"jun":6,"jul":7,"ago":8,
+              "set":9,"out":10,"nov":11,"dez":12}
+    m = re.match(r"(\d{1,2})\s+([a-zA-Z]{3})\s*(\d{4})?", s)
+    if not m:
+        return None
+    dia, mes_str, ano = m.groups()
+    mes = meses.get(mes_str.lower()[:3])
+    if not mes:
+        return None
+    ano = int(ano) if ano else date.today().year
+    try:
+        return date(ano, mes, int(dia))
+    except ValueError:
+        return None
+
+
+# ===========================================================================
+# GATILHO 6 - CITY PAGES (SUBINDO / CAINDO)
+# ===========================================================================
+def gatilho_6_city_pages(current_df, trailing_stats, city_pages):
+    """
+    Escopo: as 35 city pages cadastradas + qualquer URL que bata no padrao
+    /{estado}/{cidade}/ (deteccao automatica, cresce sozinha com paginas novas).
+    """
+    alerts = []
+    if current_df.empty:
+        return alerts
+
+    current_df = current_df.copy()
+    current_df["path"] = current_df["page"].apply(norm_path)
+
+    is_city = (current_df["path"].isin(city_pages.keys())
+              | current_df["path"].str.match(CITY_PAGE_URL_PATTERN))
+    scoped = current_df[is_city]
+
+    page_impr_now = scoped.groupby("path")["impressions"].sum()
+    page_clicks_now = scoped.groupby("path")["clicks"].sum()
+
+    page_trailing = defaultdict(lambda: [0.0] * N_TRAILING_WEEKS)
+    for (query, page), st in trailing_stats.items():
+        path = norm_path(page)
+        if path in page_impr_now.index:
+            # aproxima somando as medias de impressao de todas as queries da pagina
+            pass  # tratado abaixo de forma agregada
+
+    # media por pagina: soma media_impr de todas as (query,page) daquela pagina
+    page_media = defaultdict(float)
+    for (query, page), st in trailing_stats.items():
+        path = norm_path(page)
+        if path in page_impr_now.index:
+            page_media[path] += st["media_impr"]
+
+    for path in page_impr_now.index:
+        impr_now = float(page_impr_now[path])
+        media = page_media.get(path, 0.0)
+
+        if media < G6_NEW_PAGE_THRESHOLD:
+            if impr_now >= G6_RISE_FIRST_SIGNAL:
+                alerts.append({
+                    "gatilho": "6. City page subindo",
+                    "pagina": path, "impressoes_semana": int(impr_now),
+                    "media_impr_4sem": round(media, 0),
+                    "motivo": f"Pagina nova/pequena comecou a rankear: {int(impr_now)} impressoes essa semana.",
+                    "confianca": "MEDIA",
+                })
+        else:
+            variacao = (impr_now - media) / media
+            if variacao >= G6_RISE_RATIO:
+                alerts.append({
+                    "gatilho": "6. City page subindo",
+                    "pagina": path, "impressoes_semana": int(impr_now),
+                    "media_impr_4sem": round(media, 0),
+                    "motivo": f"Impressoes subiram {variacao*100:.0f}% vs media de 4 semanas.",
+                    "confianca": "ALTA",
+                })
+            elif -variacao >= G6_FALL_RATIO and media >= G6_FALL_MIN_AVG:
+                alerts.append({
+                    "gatilho": "6. City page caindo",
+                    "pagina": path, "impressoes_semana": int(impr_now),
+                    "media_impr_4sem": round(media, 0),
+                    "motivo": f"Impressoes cairam {-variacao*100:.0f}% vs media de 4 semanas.",
+                    "confianca": "ALTA",
+                })
+
+    alerts.sort(key=lambda x: -x["impressoes_semana"])
+    return alerts
+
+
+# ===========================================================================
+# GATILHO 7 - TRAFEGO DE MARCA
+# ===========================================================================
+def gatilho_7_marca(current_df, trailing_stats):
+    """
+    Duas formas de disparar, porque marca tem um risco que query comum nao
+    tem - alguem pode superar voce no seu proprio nome:
+      A) impressoes/clicks caindo com posicao estavel (Google mostrando
+         menos a marca - AI Overview, Knowledge Panel, etc.)
+      B) POSICAO da marca caindo (concorrente/terceiro ultrapassando voce
+         na busca do seu proprio nome - prioridade maxima, mesmo com volume
+         baixo, porque isso e estrutural, nao ruido).
+    """
+    alerts = []
+    if current_df.empty:
+        return alerts
+
+    brand_current = current_df[current_df["query"].apply(is_brand)]
+    if brand_current.empty:
+        return alerts
+
+    for _, r in brand_current.iterrows():
+        query, page = r["query"], r["page"]
+        k = (query, page)
+        st = trailing_stats.get(k)
+        if not st:
+            continue
+
+        impr = float(r["impressions"])
+        pos = float(r["position"])
+
+        # B) posicao caindo - prioridade maxima, sem exigir piso de volume
+        if st["media_position"] is not None:
+            pos_drop = pos - st["media_position"]
+            if pos_drop >= G7_POSITION_DROP_ALERT:
+                alerts.append({
+                    "gatilho": "7. Marca - POSICAO CAINDO",
+                    "query": query, "pagina": page, "posicao": round(pos, 1),
+                    "posicao_media_4sem": round(st["media_position"], 1),
+                    "impressoes_semana": int(impr),
+                    "motivo": (f"Posicao da marca caiu de {st['media_position']:.1f} para "
+                              f"{pos:.1f}. Alguem pode estar superando voce na busca do "
+                              f"seu proprio nome - verificar manualmente com urgencia."),
+                    "confianca": "ALTA",
+                    "urgencia": "MAXIMA",
+                })
+                continue   # nao precisa checar o outro motivo tambem
+
+        # A) volume caindo, posicao estavel
+        if not st["confiavel"] or st["media_impr"] < G7_MIN_AVG_IMPRESSIONS:
+            continue
+        drop = (st["media_impr"] - impr) / st["media_impr"]
+        if drop < G7_DROP_RATIO:
+            continue
+        pos_variation = abs(pos - st["media_position"]) if st["media_position"] else 999
+        if pos_variation >= G2_MAX_POSITION_VARIATION:
+            continue
+
+        alerts.append({
+            "gatilho": "7. Marca - trafego caindo",
+            "query": query, "pagina": page, "posicao": round(pos, 1),
+            "impressoes_semana": int(impr), "media_impr_4sem": round(st["media_impr"], 0),
+            "motivo": (f"Impressoes de marca cairam {drop*100:.0f}% vs media, posicao "
+                      f"estavel. Google mostrando menos a marca - checar Knowledge Panel, "
+                      f"GBP, ou AI Overview no lugar do seu site."),
+            "confianca": "ALTA",
+            "urgencia": "ALTA",
+        })
+
+    alerts.sort(key=lambda x: (x.get("urgencia") != "MAXIMA", -x["impressoes_semana"]))
+    return alerts
+
+
+# ===========================================================================
+# RADAR - VISIBILIDADE COMPLETA (nao dispara alerta, so mostra o estado)
+# ===========================================================================
+def build_radar(current_df, trailing_stats, all_alerts):
+    """
+    Uma linha por pagina com volume real: impressoes/clicks atuais, media de
+    4 semanas, tendencia, e se algum gatilho pegou ela essa semana. Isso
+    complementa os 7 gatilhos - eles avisam quando algo precisa de acao, o
+    Radar deixa ver o estado de tudo, mesmo o que nao disparou nada.
+    """
+    if current_df.empty:
+        return []
+
+    flagged_pages = defaultdict(list)
+    for a in all_alerts:
+        if "pagina" in a:
+            flagged_pages[norm_path(a["pagina"])].append(a["gatilho"])
+
+    page_agg = current_df.groupby("page", as_index=False).agg(
+        impressoes=("impressions", "sum"), clicks=("clicks", "sum"),
+        posicao=("position", "mean"))
+    page_agg = page_agg[page_agg["impressoes"] >= 30]   # corta ruido de cauda longa
+
+    page_media = defaultdict(float)
+    page_media_clicks = defaultdict(float)
+    for (query, page), st in trailing_stats.items():
+        path = norm_path(page)
+        page_media[path] += st["media_impr"]
+        page_media_clicks[path] += st["media_clicks"]
+
+    rows = []
+    for _, r in page_agg.iterrows():
+        path = norm_path(r["page"])
+        media = page_media.get(path, 0)
+        tendencia = ""
+        if media > 0:
+            var = (r["impressoes"] - media) / media
+            tendencia = f"{var*100:+.0f}%"
+
+        rows.append({
+            "pagina": path,
+            "impressoes_semana": int(r["impressoes"]),
+            "clicks_semana": int(r["clicks"]),
+            "posicao": round(float(r["posicao"]), 1),
+            "media_impr_4sem": round(media, 0),
+            "tendencia": tendencia,
+            "gatilhos_ativos": ", ".join(sorted(set(flagged_pages.get(path, [])))) or "-",
+        })
+
+    rows.sort(key=lambda x: -x["impressoes_semana"])
+    return rows
+
+
+# ===========================================================================
+# DIAGNOSTICO
+# ===========================================================================
+def print_funnel_diagnostic(current_df):
+    """
+    0 alertas pode ser 'esta tudo bem' ou pode ser 'o filtro nunca chega no
+    final'. Sem isso os dois casos ficam indistinguiveis - e nao vou
+    reportar saude do site sem checar qual dos dois esta acontecendo.
+    Roda toda semana, nao so uma vez - se o classificador ficar ruim com o
+    tempo (site muda), isso aparece aqui antes de virar zero alertas silencioso.
+    """
+    print("=" * 70)
+    print("DIAGNOSTICO DO FUNIL")
+    print("=" * 70)
+    total_queries = current_df["query"].nunique()
+    comm = current_df[current_df["query"].apply(is_commercial_local)]
+    n_comm = comm["query"].nunique()
+    n_comm_impr = comm[comm["impressions"] >= G1_MIN_IMPRESSIONS]["query"].nunique()
+    n_comm_impr_pos = comm[(comm["impressions"] >= G1_MIN_IMPRESSIONS)
+                           & (comm["position"] <= G1_MAX_POSITION)]["query"].nunique()
+    brand = current_df[current_df["query"].apply(is_brand)]
+    print(f"  Queries unicas na semana: {total_queries}")
+    print(f"  Classificadas comercial/local: {n_comm}")
+    print(f"    ...com {G1_MIN_IMPRESSIONS}+ impr numa semana: {n_comm_impr}")
+    print(f"    ...E posicao <= {G1_MAX_POSITION}: {n_comm_impr_pos}")
+    print(f"  Classificadas como marca: {brand['query'].nunique()}")
+    if n_comm == 0:
+        print("\n  ALERTA: regex comercial/local nao capturou nenhuma query.")
+    if brand.empty:
+        print("\n  ALERTA: regex de marca nao capturou nenhuma query - confirmar variacoes do nome.")
+    print()
+
+
+# ===========================================================================
+# EXCEL
+# ===========================================================================
+HEADER = PatternFill(start_color="1F3864", end_color="1F3864", fill_type="solid")
+RED = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+ORANGE = PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid")
+YELLOW = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+GREEN = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+
+
+def _sheet(wb, title, rows, columns):
+    ws = wb.create_sheet(title)
+    for i, (key, h, w) in enumerate(columns, 1):
+        c = ws.cell(1, i, h)
+        c.font = Font(bold=True, color="FFFFFF", size=10)
+        c.fill = HEADER
+        c.alignment = Alignment(vertical="center", horizontal="center", wrap_text=True)
+        ws.column_dimensions[get_column_letter(i)].width = w
+    ws.row_dimensions[1].height = 26
+    for ri, row in enumerate(rows, 2):
+        for ci, (key, _, _) in enumerate(columns, 1):
+            cell = ws.cell(ri, ci, row.get(key, ""))
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+            if key == "urgencia" and row.get("urgencia") == "MAXIMA":
+                cell.fill = RED
+                cell.font = Font(bold=True)
+            elif key == "confianca":
+                fill = {"ALTA": GREEN, "MEDIA": YELLOW, "BAIXA": ORANGE}.get(row.get("confianca"))
+                if fill:
+                    cell.fill = fill
+    ws.freeze_panes = "A2"
+    if rows:
+        ws.auto_filter.ref = f"A1:{get_column_letter(len(columns))}{len(rows)+1}"
+    return ws
+
+
+def write_report(g1, g2, g3, g4, g5, g6, g7, radar, run_date, path="turfresh_alertas.xlsx"):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Resumo"
+    ws["A1"] = f"TurFresh - Alertas Semanais - {run_date.isoformat()}"
+    ws["A1"].font = Font(bold=True, size=14)
+    ws["A3"] = f"Gatilho 1 (vazamento CTR): {len(g1)}"
+    ws["A4"] = f"Gatilho 2 (queda precoce): {len(g2)}"
+    ws["A5"] = f"Gatilho 3 (query nova): {len(g3)}"
+    ws["A6"] = f"Gatilho 4 (decaimento posts): {len(g4)}"
+    ws["A7"] = f"Gatilho 5 (sinal de vida): {len(g5)}"
+    ws["A8"] = f"Gatilho 6 (city pages): {len(g6)}"
+    ws["A9"] = f"Gatilho 7 (marca): {len(g7)}"
+    ws.column_dimensions["A"].width = 45
+
+    G1_COLS = [("query","Query",40),("pagina","Pagina",38),("posicao","Pos",8),
+               ("impressoes_semana","Impr/sem",10),("ctr_semana","CTR",9),
+               ("media_ctr_4sem","CTR medio 4sem",13),("confianca","Confianca",11),
+               ("motivo","Motivo",60)]
+    _sheet(wb, "G1 Vazamento CTR", g1, G1_COLS)
+
+    G2_COLS = [("query","Query",40),("pagina","Pagina",38),("posicao","Pos",8),
+               ("posicao_media_4sem","Pos media 4sem",13),
+               ("impressoes_semana","Impr/sem",10),("media_impr_4sem","Media 4sem",12),
+               ("queda_pct","Queda",9),("confianca","Confianca",11),("motivo","Motivo",60)]
+    _sheet(wb, "G2 Queda Precoce", g2, G2_COLS)
+
+    G3_COLS = [("query","Query",40),("pagina","Pagina",38),("posicao","Pos",8),
+               ("impressoes_semana","Impr/sem",10),("tipo","Tipo",28),
+               ("confianca","Confianca",11),("motivo","Motivo",55)]
+    _sheet(wb, "G3 Query Nova", g3, G3_COLS)
+
+    G4_COLS = [("pagina","Pagina",42),("clicks_semana","Clicks/sem",11),
+               ("media_clicks_4sem","Media 4sem",12),("impressoes_semana","Impr/sem",10),
+               ("posicao","Pos",8),("queda_pct","Queda",9),
+               ("data_otimizacao","Data otim.",11),("confianca","Confianca",11),
+               ("motivo","Motivo",55)]
+    _sheet(wb, "G4 Posts Decaindo", g4, G4_COLS)
+
+    G5_COLS = [("pagina","Pagina",42),("dias_desde_publicacao","Dias",8),
+               ("impressoes_semana","Impr/sem",10),("confianca","Confianca",11),
+               ("motivo","Motivo",65)]
+    _sheet(wb, "G5 Sinal de Vida", g5, G5_COLS)
+
+    G6_COLS = [("gatilho","Direcao",22),("pagina","Pagina",42),
+               ("impressoes_semana","Impr/sem",10),("media_impr_4sem","Media 4sem",12),
+               ("confianca","Confianca",11),("motivo","Motivo",60)]
+    _sheet(wb, "G6 City Pages", g6, G6_COLS)
+
+    G7_COLS = [("urgencia","Urgencia",10),("gatilho","Tipo",25),("query","Query",30),
+               ("pagina","Pagina",38),("posicao","Pos",8),
+               ("posicao_media_4sem","Pos media 4sem",13),
+               ("impressoes_semana","Impr/sem",10),("confianca","Confianca",11),
+               ("motivo","Motivo",60)]
+    _sheet(wb, "G7 Marca", g7, G7_COLS)
+
+    RADAR_COLS = [("pagina","Pagina",42),("impressoes_semana","Impr/sem",11),
+                  ("clicks_semana","Clicks/sem",11),("posicao","Pos",8),
+                  ("media_impr_4sem","Media 4sem",12),("tendencia","Tendencia",11),
+                  ("gatilhos_ativos","Gatilhos ativos",35)]
+    _sheet(wb, "Radar", radar, RADAR_COLS)
+
+    wb.save(path)
+    return path
+
+
+# ===========================================================================
+# EMAIL
+# ===========================================================================
+GMAIL_USER = os.environ.get("GMAIL_USER")
+GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
+ALERT_EMAIL_TO = os.environ.get("ALERT_EMAIL_TO")
+
+
+def send_email(g1, g2, g3, g4, g5, g6, g7, report_path, run_date):
+    import smtplib
+    from email.message import EmailMessage
+
+    total = len(g1) + len(g2) + len(g3) + len(g4) + len(g5) + len(g6) + len(g7)
+    marca_maxima = [a for a in g7 if a.get("urgencia") == "MAXIMA"]
+
+    body = [f"TurFresh - Alertas Semanais - {run_date.isoformat()}", "=" * 55, ""]
+    if marca_maxima:
+        body.append("!!! URGENTE - POSICAO DE MARCA CAINDO !!!")
+        for a in marca_maxima:
+            body.append(f"  {a['query']}: {a['motivo']}")
+        body.append("")
+
+    body.append(f"Total: {total} alertas")
+    body.append(f"  G1 vazamento CTR: {len(g1)}")
+    body.append(f"  G2 queda precoce: {len(g2)}")
+    body.append(f"  G3 query nova: {len(g3)}")
+    body.append(f"  G4 decaimento posts: {len(g4)}")
+    body.append(f"  G5 sinal de vida: {len(g5)}")
+    body.append(f"  G6 city pages: {len(g6)}")
+    body.append(f"  G7 marca: {len(g7)}")
+    body.append("\nDetalhe completo na planilha anexa.")
+    text = "\n".join(body)
+
+    if not (GMAIL_USER and GMAIL_APP_PASSWORD and ALERT_EMAIL_TO):
+        print(text)
+        return
+
+    msg = EmailMessage()
+    prefix = "[URGENTE] " if marca_maxima else ""
+    msg["Subject"] = f"{prefix}[TurFresh] {total} alertas - {run_date.isoformat()}"
+    msg["From"] = GMAIL_USER
+    msg["To"] = ALERT_EMAIL_TO
+    msg.set_content(text)
+    with open(report_path, "rb") as f:
+        msg.add_attachment(f.read(), maintype="application",
+                           subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           filename=f"turfresh-alertas-{run_date.isoformat()}.xlsx")
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
+        s.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+        s.send_message(msg)
+    print("Email enviado.")
+    print(text)
+
+
+# ===========================================================================
 # MAIN
 # ===========================================================================
 def main():
+    run_date = date.today()
     service = get_gsc_service()
     current, trailing, windows = fetch_trailing_weeks(service)
 
@@ -276,19 +987,39 @@ def main():
     stats = build_trailing_stats(trailing)
     print(f"  {len(stats)} combinacoes query+pagina no historico\n")
 
-    print("Rodando Gatilho 1 (vazamento de CTR)...")
-    g1 = gatilho_1_vazamento_ctr(current, stats)
-    print(f"  {len(g1)} alertas\n")
+    print("Carregando dados de referencia...")
+    seo_log_urls = load_seo_log_urls()
+    city_pages = load_city_pages()
+    print()
 
-    print("=" * 70)
-    print(f"RESULTADOS - {len(g1)} alertas de vazamento de CTR")
-    print("=" * 70)
-    for a in g1[:20]:
-        print(f"\n[{a['confianca']}] {a['query']}")
-        print(f"  {a['pagina']}")
-        print(f"  pos {a['posicao']} | {a['impressoes_semana']:,} impr | "
-              f"CTR {a['ctr_semana']} (media 4sem: {a['media_ctr_4sem']})")
-        print(f"  {a['motivo']}")
+    print_funnel_diagnostic(current)
+
+    print("Rodando os 7 gatilhos...")
+    g1 = gatilho_1_vazamento_ctr(current, stats)
+    g2 = gatilho_2_queda_precoce(current, stats)
+    g3 = gatilho_3_query_nova(current, stats)
+    g4 = gatilho_4_decaimento_posts(current, stats, seo_log_urls)
+    g5 = gatilho_5_sinal_vida(current, city_pages, run_date)
+    g6 = gatilho_6_city_pages(current, stats, city_pages)
+    g7 = gatilho_7_marca(current, stats)
+
+    all_alerts = g1 + g2 + g3 + g4 + g5 + g6 + g7
+    print(f"  G1 vazamento CTR: {len(g1)}")
+    print(f"  G2 queda precoce: {len(g2)}")
+    print(f"  G3 query nova: {len(g3)}")
+    print(f"  G4 decaimento posts: {len(g4)}")
+    print(f"  G5 sinal de vida: {len(g5)}")
+    print(f"  G6 city pages: {len(g6)}")
+    print(f"  G7 marca: {len(g7)}")
+    print(f"  TOTAL: {len(all_alerts)} alertas\n")
+
+    radar = build_radar(current, stats, all_alerts)
+    print(f"Radar: {len(radar)} paginas com volume real\n")
+
+    report_path = write_report(g1, g2, g3, g4, g5, g6, g7, radar, run_date)
+    print(f"Relatorio: {report_path}\n")
+
+    send_email(g1, g2, g3, g4, g5, g6, g7, report_path, run_date)
 
 
 if __name__ == "__main__":
