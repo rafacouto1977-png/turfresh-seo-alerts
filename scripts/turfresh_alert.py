@@ -26,6 +26,17 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
+try:
+    from google.analytics.data_v1beta import BetaAnalyticsDataClient
+    from google.analytics.data_v1beta.types import (
+        DateRange, Dimension, Metric, Filter, FilterExpression, RunReportRequest,
+    )
+    GA4_AVAILABLE = True
+except ImportError:
+    GA4_AVAILABLE = False
+
+GA4_PROPERTY_ID = os.environ.get("GA4_PROPERTY_ID", "")
+
 # ===========================================================================
 # CONFIG
 # ===========================================================================
@@ -91,6 +102,8 @@ G7_MIN_AVG_IMPRESSIONS = 20
 G7_DROP_RATIO = 0.30
 G7_POSITION_DROP_ALERT = 4.0
 G7_MAX_MEANINGFUL_POSITION = 20   # abaixo do top 20 a posicao e ruido, nao alerta
+
+
 
 # ===========================================================================
 # CLASSIFICADOR DE QUERY COMERCIAL/LOCAL
@@ -773,7 +786,6 @@ def gatilho_7_marca(current_df, trailing_stats):
     return alerts
 
 
-# ===========================================================================
 # RADAR - VISIBILIDADE COMPLETA (nao dispara alerta, so mostra o estado)
 # ===========================================================================
 def build_radar(current_df, trailing_stats, all_alerts):
@@ -908,7 +920,7 @@ def _sheet(wb, title, rows, columns):
     return ws
 
 
-def write_report(g1, g2, g3, g4, g5, g6, g7, radar, run_date, path="turfresh_alertas.xlsx"):
+def write_report(g1, g2, g3, g4, g5, g6, g7, g8, radar, run_date, path="turfresh_alertas.xlsx"):
     wb = Workbook()
     ws = wb.active
     ws.title = "Resumo"
@@ -921,6 +933,7 @@ def write_report(g1, g2, g3, g4, g5, g6, g7, radar, run_date, path="turfresh_ale
     ws["A7"] = f"Gatilho 5 (sinal de vida): {len(g5)}"
     ws["A8"] = f"Gatilho 6 (city pages): {len(g6)}"
     ws["A9"] = f"Gatilho 7 (marca): {len(g7)}"
+    ws["A10"] = f"Gatilho 8 (CTA de blog): {len(g8)} campanhas com sessao essa semana"
     ws.column_dimensions["A"].width = 45
 
     G1_COLS = [("query","Query",40),("pagina","Pagina",38),("posicao","Pos",8),
@@ -964,6 +977,11 @@ def write_report(g1, g2, g3, g4, g5, g6, g7, radar, run_date, path="turfresh_ale
                ("motivo","Motivo",60)]
     _sheet(wb, "G7 Marca", g7, G7_COLS)
 
+    G8_COLS = [("campanha","Campanha (post)",42),("sessoes_semana","Sessoes essa semana",16),
+               ("sessoes_semana_anterior","Sessoes sem. anterior",18),
+               ("variacao","Variacao",12),("alerta","Alerta",55)]
+    _sheet(wb, "G8 CTA Blog", g8, G8_COLS)
+
     RADAR_COLS = [("pagina","Pagina",42),("impressoes_semana","Impr/sem",11),
                   ("clicks_semana","Clicks/sem",11),("posicao","Pos",8),
                   ("media_impr_4sem","Media 4sem",12),("tendencia","Tendencia",11),
@@ -980,6 +998,10 @@ def write_report(g1, g2, g3, g4, g5, g6, g7, radar, run_date, path="turfresh_ale
 GMAIL_USER = os.environ.get("GMAIL_USER")
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
 ALERT_EMAIL_TO = os.environ.get("ALERT_EMAIL_TO")
+
+# --- GA4: CTA banner do blog ---
+GA4_PROPERTY_ID = os.environ.get("GA4_PROPERTY_ID", "")
+CTA_UTM_MEDIUM = "cta_banner"
 
 MAX_ITEMS_PER_SECTION = 8   # o e-mail mostra o topo; a planilha tem a lista inteira
 
@@ -998,12 +1020,18 @@ def _html_escape(s):
     return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
 
-def _build_html_email(data, run_date, total, marca_maxima):
+def _build_html_email(data, run_date, total, marca_maxima, g8):
     """
     Estrutura visual: caixa vermelha de urgencia no topo (se houver), depois
     um resumo em grade com contagem por gatilho, depois cada gatilho que tem
     alerta vira uma secao com no maximo MAX_ITEMS_PER_SECTION linhas - o
     resto fica so na planilha anexa, para o e-mail nao virar parede de texto.
+
+    G8 (CTA de blog) e diferente dos outros: nao e deteccao de anomalia, e
+    visibilidade direta de lead - Rafael quer ver toda semana quais posts
+    estao levando gente pro contato, nao so quando algo quebra. Por isso tem
+    secao propria, sempre visivel quando ha dado, em vez de entrar no loop
+    dos outros 7 (que so aparecem quando tem alerta).
     """
     css_box = ("border-radius:8px;padding:16px 20px;margin-bottom:16px;"
                "font-family:Arial,Helvetica,sans-serif;")
@@ -1066,13 +1094,43 @@ def _build_html_email(data, run_date, total, marca_maxima):
             html.append(f'<li><i>+{len(rows)-MAX_ITEMS_PER_SECTION} outras na planilha anexa</i></li>')
         html.append('</ul></div>')
 
+    # G8 - CTA de blog: secao propria, sempre visivel (nao e anomalia, e lead)
+    if g8:
+        total_sessoes = sum(r["sessoes_semana"] for r in g8)
+        quebrados = [r for r in g8 if r.get("alerta")]
+        box_color = "#FFEBEE" if quebrados else "#E8F5E9"
+        border = "2px solid #D32F2F" if quebrados else "1px solid #A5D6A7"
+        html.append(f'<div style="{css_box}background:{box_color};border:{border};">')
+        html.append(f'<strong>CTA de blog (cta_banner) - {total_sessoes} sessoes essa semana</strong>')
+        html.append('<table style="width:100%;margin-top:10px;font-size:13px;'
+                    'border-collapse:collapse;">')
+        html.append('<tr style="border-bottom:1px solid #ccc;"><td style="padding:4px 8px;">'
+                    '<b>Post (campanha)</b></td><td style="padding:4px 8px;text-align:right;">'
+                    '<b>Essa semana</b></td><td style="padding:4px 8px;text-align:right;">'
+                    '<b>Anterior</b></td><td style="padding:4px 8px;"><b>Variacao</b></td></tr>')
+        for r in g8[:MAX_ITEMS_PER_SECTION]:
+            row_bg = "background:#FFCDD2;" if r.get("alerta") else ""
+            html.append(f'<tr style="{row_bg}"><td style="padding:4px 8px;">'
+                        f'{_html_escape(r["campanha"])}</td>'
+                        f'<td style="padding:4px 8px;text-align:right;">{r["sessoes_semana"]}</td>'
+                        f'<td style="padding:4px 8px;text-align:right;">{r["sessoes_semana_anterior"]}</td>'
+                        f'<td style="padding:4px 8px;">{r["variacao"]}</td></tr>')
+            if r.get("alerta"):
+                html.append(f'<tr style="background:#FFCDD2;"><td colspan="4" '
+                           f'style="padding:2px 8px 6px 8px;font-size:12px;color:#B71C1C;">'
+                           f'⚠ {_html_escape(r["alerta"])}</td></tr>')
+        if len(g8) > MAX_ITEMS_PER_SECTION:
+            html.append(f'<tr><td colspan="4" style="padding:4px 8px;font-style:italic;'
+                       f'color:#888;">+{len(g8)-MAX_ITEMS_PER_SECTION} outras na planilha</td></tr>')
+        html.append('</table></div>')
+
     html.append('<p style="color:#666;font-size:12px;">Detalhe completo, com evidencia e '
                'motivo de cada alerta, na planilha anexa.</p>')
     html.append('</div>')
     return "\n".join(html)
 
 
-def send_email(g1, g2, g3, g4, g5, g6, g7, report_path, run_date):
+def send_email(g1, g2, g3, g4, g5, g6, g7, g8, report_path, run_date):
     import smtplib
     from email.message import EmailMessage
 
@@ -1090,10 +1148,18 @@ def send_email(g1, g2, g3, g4, g5, g6, g7, report_path, run_date):
     text_lines.append(f"Total: {total} alertas")
     for key, label, _ in GATILHO_INFO:
         text_lines.append(f"  {label}: {len(data[key])}")
+    if g8:
+        total_sessoes = sum(r["sessoes_semana"] for r in g8)
+        text_lines.append(f"\nCTA de blog (cta_banner): {total_sessoes} sessoes essa semana, "
+                          f"{len(g8)} campanhas")
+        for r in g8[:MAX_ITEMS_PER_SECTION]:
+            marca = " [ALERTA]" if r.get("alerta") else ""
+            text_lines.append(f"  {r['campanha']}: {r['sessoes_semana']} "
+                             f"({r['variacao']}){marca}")
     text_lines.append("\nDetalhe completo na planilha anexa.")
     text = "\n".join(text_lines)
 
-    html = _build_html_email(data, run_date, total, marca_maxima)
+    html = _build_html_email(data, run_date, total, marca_maxima, g8)
 
     if not (GMAIL_USER and GMAIL_APP_PASSWORD and ALERT_EMAIL_TO):
         print(text)
@@ -1115,6 +1181,97 @@ def send_email(g1, g2, g3, g4, g5, g6, g7, report_path, run_date):
         s.send_message(msg)
     print("Email enviado (HTML).")
     print(text)
+
+
+# ===========================================================================
+# GA4 - CTA BANNER DO BLOG (Gatilho 8)
+# ===========================================================================
+def get_ga4_client():
+    """
+    Falha graciosamente: se a API nao estiver ativada, o secret faltando, ou
+    a conta de servico sem acesso, devolve None em vez de derrubar o script
+    inteiro. Os outros 7 gatilhos (GSC) nao dependem do GA4 e devem continuar
+    funcionando mesmo se essa parte falhar.
+    """
+    if not GA4_PROPERTY_ID:
+        print("  GA4_PROPERTY_ID nao configurado - pulando Gatilho 8 (CTA banner).")
+        return None
+    try:
+        from google.analytics.data_v1beta import BetaAnalyticsDataClient
+        creds = service_account.Credentials.from_service_account_info(
+            {"type": "service_account", "client_email": GSC_CLIENT_EMAIL,
+             "private_key": GSC_PRIVATE_KEY,
+             "token_uri": "https://oauth2.googleapis.com/token"},
+            scopes=["https://www.googleapis.com/auth/analytics.readonly"])
+        return BetaAnalyticsDataClient(credentials=creds)
+    except Exception as e:
+        print(f"  GA4 nao disponivel ({e}) - pulando Gatilho 8 (CTA banner).")
+        return None
+
+
+def fetch_cta_banner_by_campaign(client, start_date, end_date):
+    """
+    Sessoes chegando com utm_medium=cta_banner, agrupadas por utm_campaign
+    (que no seu setup e o nome do post). Isso responde 'qual post esta
+    levando gente pro contato', nao so 'quantos clicks no total'.
+    """
+    if client is None:
+        return pd.DataFrame()
+    try:
+        from google.analytics.data_v1beta.types import (
+            DateRange, Dimension, Metric, RunReportRequest, Filter, FilterExpression)
+        request = RunReportRequest(
+            property=f"properties/{GA4_PROPERTY_ID}",
+            date_ranges=[DateRange(start_date=start_date.isoformat(),
+                                   end_date=end_date.isoformat())],
+            dimensions=[Dimension(name="sessionCampaignName")],
+            metrics=[Metric(name="sessions")],
+            dimension_filter=FilterExpression(
+                filter=Filter(field_name="sessionMedium",
+                             string_filter=Filter.StringFilter(value=CTA_UTM_MEDIUM))),
+        )
+        resp = client.run_report(request)
+        rows = []
+        for r in resp.rows:
+            rows.append({"campanha": r.dimension_values[0].value,
+                        "sessoes": int(r.metric_values[0].value)})
+        return pd.DataFrame(rows)
+    except Exception as e:
+        print(f"  Erro ao buscar dados de CTA banner: {e}")
+        return pd.DataFrame()
+
+
+def gatilho_8_cta_banner(current_cta, previous_cta):
+    """
+    Nao e deteccao de anomalia como os outros 7 - e visibilidade direta de
+    lead. Toda campanha (post) com sessao essa semana aparece, ordenada por
+    volume. Alem disso, sinaliza quando uma campanha que tinha sessoes na
+    semana anterior caiu para zero (CTA pode estar quebrado ou removido).
+    """
+    rows = []
+    prev_map = dict(zip(previous_cta.get("campanha", []), previous_cta.get("sessoes", [])))
+
+    for _, r in current_cta.iterrows():
+        campanha, sessoes = r["campanha"], int(r["sessoes"])
+        prev = prev_map.get(campanha, 0)
+        if prev > 0:
+            var = f"{(sessoes-prev)/prev*100:+.0f}%"
+        else:
+            var = "novo"
+        rows.append({"campanha": campanha, "sessoes_semana": sessoes,
+                    "sessoes_semana_anterior": prev, "variacao": var,
+                    "alerta": ""})
+
+    # campanhas que tinham sessao e cairam pra zero essa semana
+    current_campaigns = set(current_cta.get("campanha", []))
+    for campanha, prev in prev_map.items():
+        if prev >= 3 and campanha not in current_campaigns:
+            rows.append({"campanha": campanha, "sessoes_semana": 0,
+                        "sessoes_semana_anterior": prev, "variacao": "-100%",
+                        "alerta": "Tinha sessoes, foi a zero - checar se o CTA ainda existe no post"})
+
+    rows.sort(key=lambda x: -x["sessoes_semana"])
+    return rows
 
 
 # ===========================================================================
@@ -1159,10 +1316,19 @@ def main():
     radar = build_radar(current, stats, all_alerts)
     print(f"Radar: {len(radar)} paginas com volume real\n")
 
-    report_path = write_report(g1, g2, g3, g4, g5, g6, g7, radar, run_date)
+    print("Buscando dados de CTA banner (GA4)...")
+    ga4_client = get_ga4_client()
+    cur_start, cur_end = windows[-1]
+    prev_start, prev_end = windows[-2]
+    current_cta = fetch_cta_banner_by_campaign(ga4_client, cur_start, cur_end)
+    previous_cta = fetch_cta_banner_by_campaign(ga4_client, prev_start, prev_end)
+    g8 = gatilho_8_cta_banner(current_cta, previous_cta)
+    print(f"  G8 CTA banner: {len(g8)} campanhas com dado\n")
+
+    report_path = write_report(g1, g2, g3, g4, g5, g6, g7, g8, radar, run_date)
     print(f"Relatorio: {report_path}\n")
 
-    send_email(g1, g2, g3, g4, g5, g6, g7, report_path, run_date)
+    send_email(g1, g2, g3, g4, g5, g6, g7, g8, report_path, run_date)
 
 
 if __name__ == "__main__":
