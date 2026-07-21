@@ -161,7 +161,10 @@ def norm_path(url):
 
 def load_seo_log_urls():
     """As 69 URLs vivas do SEO Log (as 44 redirecionadas ja foram excluidas
-    na extracao). Retorna dict path -> data_otimizacao (string, pode ser vazia)."""
+    na extracao). Retorna dict path -> {data_otimizacao, keyword, meta_title,
+    h1, feito}. O 'keyword' e o Meta Title/H1 sao terreno real (o que a
+    pagina de fato mira), nao mais um chute - isso deixa o Gatilho 1 e o
+    Gatilho 4 checarem contra a intencao real da pagina em vez de adivinhar."""
     if not os.path.exists(SEO_LOG_PATH):
         print(f"  Aviso: {SEO_LOG_PATH} nao encontrado. Gatilho 4 fica vazio.")
         return {}
@@ -170,9 +173,56 @@ def load_seo_log_urls():
         import csv
         for row in csv.DictReader(f):
             path = norm_path(row["path"])
-            out[path] = row.get("data_otimizacao", "")
-    print(f"  SEO Log: {len(out)} URLs vivas carregadas")
+            out[path] = {
+                "data_otimizacao": row.get("data_otimizacao", ""),
+                "keyword": row.get("keyword", ""),
+                "meta_title": row.get("meta_title", ""),
+                "h1": row.get("h1", ""),
+                "feito": row.get("feito", ""),
+            }
+    print(f"  SEO Log: {len(out)} URLs vivas carregadas (com keyword/title/notas)")
     return out
+
+
+KNOWN_ISSUE_PATTERNS = [r"\bbug\b", r"\bpending\b", r"\bneeded\b", r"\bissue\b",
+                        r"\bnot showing\b", r"\bmissing\b", r"\bbroken\b"]
+
+
+def extract_known_issue(feito_text):
+    """
+    Rafael ja documenta problemas conhecidos no campo 'Feito' quando otimiza
+    um post (ex: 'Bug: H1 not showing on mobile'). Se um alerta bate numa
+    pagina que ja tem isso anotado, essa e uma causa muito mais confiavel do
+    que qualquer hipotese generica - e o proprio dono da pagina que registrou.
+    Retorna a frase relevante, ou None se nao achar nada.
+    """
+    if not feito_text:
+        return None
+    for pattern in KNOWN_ISSUE_PATTERNS:
+        m = re.search(rf"([^.]*{pattern}[^.]*)", feito_text, re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+    return None
+
+
+def keyword_overlap_ratio(query, keyword, meta_title):
+    """
+    Compara a query que disparou o alerta contra o Keyword Principal e o
+    Meta Title reais da pagina. Overlap alto = a pagina ja mira essa
+    intencao de proposito, entao 'titulo desalinhado' fica pouco provavel.
+    Overlap baixo = a query pode nao ser o foco real da pagina.
+    """
+    def tokens(s):
+        return set(w for w in re.findall(r"[a-z]+", str(s).lower())
+                   if len(w) > 2 and w not in {"the","and","for","how","your",
+                       "with","that","this","from","are","you"})
+    q_tok = tokens(query)
+    if not q_tok:
+        return 0.0
+    target_tok = tokens(keyword) | tokens(meta_title)
+    if not target_tok:
+        return 0.0
+    return len(q_tok & target_tok) / len(q_tok)
 
 
 def load_city_pages():
@@ -332,7 +382,7 @@ def build_trailing_stats(trailing_weeks):
 # ===========================================================================
 # GATILHO 1 - VAZAMENTO DE CTR
 # ===========================================================================
-def gatilho_1_vazamento_ctr(current_df, trailing_stats):
+def gatilho_1_vazamento_ctr(current_df, trailing_stats, seo_log_urls=None):
     """
     Dispara quando: impressoes_semana >= 500 E posicao <= 8 E
     (CTR < 1% OU CTR caiu >= 40% vs media_4sem)
@@ -342,14 +392,24 @@ def gatilho_1_vazamento_ctr(current_df, trailing_stats):
     +2). Sem isso, uma pagina que acabou de subir para o top 8 essa semana
     teria uma "media" de CTR baixa so porque antes ela rankeava pior - isso
     pareceria vazamento sem ser.
+
+    Enriquecimento com o SEO Log (quando a pagina esta nas 67 vivas): em vez
+    de so hipotetizar "talvez o titulo nao combine", compara a query real
+    contra o Keyword Principal e o Meta Title que Rafael de fato escreveu
+    para aquela pagina. Se baterem bem, a hipotese de titulo desalinhado
+    perde forca de verdade, nao so por suposicao. E se o campo "Feito" ja
+    tem um bug ou pendencia documentada, isso e mostrado direto - e mais
+    confiavel que qualquer hipotese gerada.
     """
     alerts = []
     if current_df.empty:
         return alerts
+    seo_log_urls = seo_log_urls or {}
 
     for _, r in current_df.iterrows():
         query, page = r["query"], r["page"]
-        if not is_commercial_local(query):
+        page_is_tracked = norm_path(page) in seo_log_urls
+        if not is_commercial_local(query) and not page_is_tracked:
             continue
 
         impr = float(r["impressions"])
@@ -388,7 +448,40 @@ def gatilho_1_vazamento_ctr(current_df, trailing_stats):
 
         confianca = "HIGH" if (st and st["confiavel"]) else "LOW (limited history)"
 
-        alerts.append({
+        # --- enriquecimento com dado real da pagina, quando disponivel ---
+        seo_log_hyp = None
+        seo_log_verify = None
+        seo_log_action = None
+        page_path = norm_path(page)
+        meta = seo_log_urls.get(page_path)
+
+        if meta:
+            known_issue = extract_known_issue(meta.get("feito", ""))
+            overlap = keyword_overlap_ratio(query, meta.get("keyword", ""), meta.get("meta_title", ""))
+
+            if known_issue:
+                seo_log_hyp = (f"This page already has a documented issue from its last "
+                               f"optimization: \"{known_issue}\"")
+                seo_log_verify = "Confirm whether this documented issue is still unresolved."
+                seo_log_action = "Fix the documented issue - this is more likely the cause than a title/meta mismatch."
+            elif overlap >= 0.5:
+                seo_log_hyp = (f"This page is already targeted at \"{meta.get('keyword','')}\" "
+                               f"(meta title: \"{meta.get('meta_title','')}\"), which closely "
+                               f"matches this query - a title/meta rewrite is unlikely to be the fix.")
+                seo_log_verify = ("Check the live SERP for a map pack, People Also Ask, or AI "
+                                  "Overview above position " + f"{pos:.0f} - that is the more "
+                                  "likely cause given the title already matches.")
+                seo_log_action = "Do not rewrite the title/meta. Track the SERP feature instead - there is usually no direct fix."
+            else:
+                seo_log_hyp = (f"This page is logged as targeting \"{meta.get('keyword','')}\" "
+                               f"(meta title: \"{meta.get('meta_title','')}\"), which does not "
+                               f"closely match this triggering query - the page may be ranking "
+                               f"for this query almost by accident.")
+                seo_log_verify = ("Decide whether this query is worth targeting on this page at "
+                                  "all, or whether a dedicated page/section would serve it better.")
+                seo_log_action = "Only adjust this page's title/meta if you decide this query belongs to it. Otherwise, this may not be worth optimizing for."
+
+        alert = {
             "gatilho": "1. CTR Gap",
             "query": query,
             "pagina": page,
@@ -400,7 +493,12 @@ def gatilho_1_vazamento_ctr(current_df, trailing_stats):
                                if st and st["media_impr"] > 0 else "no history"),
             "motivo": motivo,
             "confianca": confianca,
-        })
+        }
+        if seo_log_hyp:
+            alert["hypothesis_override"] = seo_log_hyp
+            alert["verify_override"] = seo_log_verify
+            alert["action_override"] = seo_log_action
+        alerts.append(alert)
 
     alerts.sort(key=lambda x: -x["impressoes_semana"])
     return alerts
@@ -543,6 +641,9 @@ def gatilho_4_decaimento_posts(current_df, trailing_stats, seo_log_urls):
         if drop < G4_DROP_RATIO:
             continue
 
+        meta = seo_log_urls.get(path, {})
+        known_issue = extract_known_issue(meta.get("feito", ""))
+
         alerts.append({
             "gatilho": "4. Optimized Post Decay",
             "pagina": path,
@@ -551,7 +652,9 @@ def gatilho_4_decaimento_posts(current_df, trailing_stats, seo_log_urls):
             "impressoes_semana": int(page_impr.get(path, 0)),
             "posicao": round(float(page_pos.get(path, 0)), 1),
             "queda_pct": f"{drop*100:.0f}%",
-            "data_otimizacao": seo_log_urls.get(path, ""),
+            "data_otimizacao": meta.get("data_otimizacao", ""),
+            "keyword": meta.get("keyword", ""),
+            "known_issue": known_issue,
             "motivo": f"Clicks dropped {drop*100:.0f}% vs the previous 4-week average.",
             "confianca": "HIGH" if media_clicks >= 40 else "MEDIUM",
         })
@@ -1020,24 +1123,67 @@ def _html_escape(s):
     return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
 
-# What to do, per trigger type. Matched against the "gatilho" field so each
-# task arrives with a concrete next step, not just evidence - ready to
-# become a ClickUp task without Rafael having to write the action himself.
-ACTION_BY_TRIGGER = {
-    "1. CTR Gap": "Rewrite the title/meta description to better match search intent for this query.",
-    "2. Early Impression Drop": "Check the live SERP for this query - a new AI Overview or SERP feature may be reducing visibility. Position is stable, so this is not a ranking problem.",
-    "4. Optimized Post Decay": "Refresh this post's content and check which competitor pages now outrank it.",
-    "5. Content Life Signal (Negative)": "Check URL Inspection in GSC - likely an indexing issue.",
-    "6. City Page Falling": "Investigate this city page - check for technical issues or new competitor activity in this market.",
-    "7. Brand - POSITION DROPPING": "Manually check the SERP for this brand query - a competitor or negative content may be outranking the homepage.",
-    "7. Brand - Traffic Dropping": "Check the Knowledge Panel and Google Business Profile for the brand term - an AI Overview may be showing instead of the site.",
+# Guidance per trigger type, split into HYPOTHESIS (what might explain it -
+# never certainty) and VERIFY (a 2-minute check before touching anything).
+# None of the 8 triggers can see title tags, on-page content, or the live
+# SERP - they only see aggregate GSC/GA4 numbers. A prescriptive "rewrite
+# the title" is a guess dressed up as an instruction: the homepage might
+# already be well-optimized for this exact intent, and the real cause could
+# be a SERP feature, a better-suited page elsewhere on the site, or nothing
+# fixable at all. Verify first; act only on what verification finds.
+GUIDANCE_BY_TRIGGER = {
+    "1. CTR Gap": {
+        "hypothesis": "Three possible causes, not mutually exclusive: the title/meta may not match this query's intent as written; a SERP feature (map pack, People Also Ask, ads) may be taking the click above your result; or a different page on the site may be a more precise match for this exact query than the one ranking.",
+        "verify": "Search this exact query in an incognito window. Check: (a) does the live title/snippet actually match it, (b) is there a map pack/PAA/ad block above position 5, (c) is the ranking page (see Page) really the best match, or would another page fit better.",
+        "action": "Only rewrite the title/meta if (a) shows a real mismatch. If a SERP feature is the cause, there is no copy fix - track it instead. If a different page would fit better, that's a content/IA decision, not a copy edit.",
+    },
+    "2. Early Impression Drop": {
+        "hypothesis": "Position held steady while impressions dropped, which usually points at Google showing this result less (a new AI Overview or SERP feature), not a ranking problem.",
+        "verify": "Check the live SERP for this query for a new AI Overview, featured snippet, or other feature that wasn't there in the prior period.",
+        "action": "No content or ranking action is likely needed. If a feature is confirmed, there is currently no fix - monitor it. If verification shows something else changed, treat as a new finding, not this one.",
+    },
+    "4. Optimized Post Decay": {
+        "hypothesis": "A competitor may have published fresher or more complete content, or this post may no longer fully answer the query as well as it once did.",
+        "verify": "Compare this page against the current top 3 results for its main query - what do they cover, or cover more recently, that this page doesn't?",
+        "action": "Refresh the content only if verification shows a real gap versus what's currently ranking above it.",
+    },
+    "5. Content Life Signal (Negative)": {
+        "hypothesis": "Most likely an indexing issue - the page may not have been crawled yet, or is blocked/excluded.",
+        "verify": "Run URL Inspection in GSC for this exact page.",
+        "action": "Follow whatever URL Inspection reports (request indexing, fix a block, etc.).",
+    },
+    "6. City Page Falling": {
+        "hypothesis": "Could be a technical issue on the page itself, a change in the local map pack, or new competitor activity specific to this city.",
+        "verify": "Load the page to confirm it works, check this city's map pack position, and scan the live SERP for a new competitor.",
+        "action": "Act on whichever of the three verification finds - do not assume a content rewrite is the fix without checking first.",
+    },
+    "7. Brand - POSITION DROPPING": {
+        "hypothesis": "Something is now outranking the homepage for the brand's own name - could be a competitor, a review/complaint site, or a directory listing.",
+        "verify": "Search the brand query directly and see what outranks the homepage.",
+        "action": "The fix depends entirely on what's found - there's no generic action for this until verification identifies the competing result.",
+    },
+    "7. Brand - Traffic Dropping": {
+        "hypothesis": "Google may be showing an AI Overview, Knowledge Panel, or other feature in place of a click-through to the site for brand searches.",
+        "verify": "Check the Knowledge Panel and the live SERP for the brand term for a new feature sitting above the organic result.",
+        "action": "If a feature is confirmed, there's no direct fix - this is worth tracking. If nothing has changed on the SERP, treat as an open question, not a confirmed cause.",
+    },
 }
 
-# Trigger types that represent a problem needing a fix. Everything else
-# (new query opportunities, city pages rising, positive life signals) is
-# good news or upside - it stays in the spreadsheet for context, but does
-# not belong in a "things to fix" task list.
-URGENT_TRIGGER_TYPES = set(ACTION_BY_TRIGGER.keys())
+URGENT_TRIGGER_TYPES = set(GUIDANCE_BY_TRIGGER.keys())
+
+
+def _task_impact(alert):
+    """
+    A rough, comparable 'how much is at stake' number, used only to order
+    tasks within the same priority tier - not to decide the tier itself.
+    Impressions and clicks aren't on the same scale, so clicks get a
+    multiplier; this doesn't need to be precise, just directionally right.
+    """
+    if alert.get("impressoes_semana") is not None:
+        return float(alert["impressoes_semana"])
+    if alert.get("media_clicks_4sem") is not None:
+        return float(alert["media_clicks_4sem"]) * 10
+    return 0.0
 
 
 def build_urgent_tasks(g1, g2, g3, g4, g5, g6, g7, g8):
@@ -1047,22 +1193,65 @@ def build_urgent_tasks(g1, g2, g3, g4, g5, g6, g7, g8):
     signals (new queries, pages rising, positive life signals, and G8 rows
     without a break) are left out of this list on purpose; they still live
     in the full spreadsheet.
+
+    Each task carries hypothesis + verify + action rather than a single
+    prescriptive instruction, because none of these triggers can see
+    on-page content or the live SERP - only aggregate numbers.
+
+    Ordering has two layers, not one: priority tier first (MAXIMUM > HIGH >
+    MEDIUM), then within a tier, by how much is actually at stake
+    (impressions/clicks). A documented known issue also gets pulled to the
+    top of its tier - a confirmed, already-diagnosed problem is the most
+    actionable item on the list, more useful to act on first than a bigger
+    but unconfirmed one.
     """
     tasks = []
 
     for alert in g1 + g2 + g4 + g5 + g6 + g7:
-        if alert.get("gatilho") not in URGENT_TRIGGER_TYPES:
+        trigger = alert.get("gatilho")
+        if trigger not in URGENT_TRIGGER_TYPES:
             continue
         priority = "MAXIMUM" if alert.get("urgencia") == "MAXIMUM" else (
             "HIGH" if alert.get("confianca") == "HIGH" or alert.get("urgencia") == "HIGH"
             else "MEDIUM")
+        guidance = GUIDANCE_BY_TRIGGER[trigger]
+
+        # G1 alerts enriched against the real SEO Log (keyword/title/known
+        # issues) carry their own hypothesis - more reliable than the
+        # generic multi-cause guess, because it's grounded in what the page
+        # actually targets, not a guess about what it might target.
+        hypothesis = alert.get("hypothesis_override") or guidance["hypothesis"]
+        verify = alert.get("verify_override") or guidance["verify"]
+        action = alert.get("action_override") or guidance["action"]
+
+        # G4 (post decay): a documented known issue is more reliable than
+        # the generic "compare against competitors" guess.
+        has_known_issue = bool(alert.get("known_issue"))
+        if trigger == "4. Optimized Post Decay" and has_known_issue:
+            hypothesis = f"This page has a documented issue from its last optimization: \"{alert['known_issue']}\""
+            verify = "Confirm whether this documented issue is still unresolved."
+            action = "Fix the documented issue first - it is more likely the cause than external competition."
+        elif "documented issue" in hypothesis:
+            has_known_issue = True
+
+        impact = _task_impact(alert)
+        if has_known_issue:
+            # a confirmed cause beats a bigger but unconfirmed one - float
+            # to the top of its tier, and never leave it stuck at MEDIUM.
+            if priority == "MEDIUM":
+                priority = "HIGH"
+            impact += 1_000_000
+
         tasks.append({
             "priority": priority,
-            "trigger": alert["gatilho"],
+            "_impact": impact,
+            "trigger": trigger,
             "target": alert.get("query") or alert.get("pagina", ""),
             "page": alert.get("pagina", ""),
             "evidence": alert.get("motivo", ""),
-            "action": ACTION_BY_TRIGGER.get(alert["gatilho"], "Review manually."),
+            "hypothesis": hypothesis,
+            "verify": verify,
+            "action": action,
         })
 
     for r in g8:
@@ -1070,15 +1259,18 @@ def build_urgent_tasks(g1, g2, g3, g4, g5, g6, g7, g8):
             continue
         tasks.append({
             "priority": "HIGH",
+            "_impact": float(r.get("sessoes_semana_anterior", 0)) * 10,
             "trigger": "8. Blog CTA",
             "target": r["campanha"],
             "page": "",
             "evidence": r["alerta"],
-            "action": "Check if the CTA banner is still present on this post and that the link is not broken.",
+            "hypothesis": "The CTA banner was removed from the post, the link broke, or the UTM parameter was dropped or changed.",
+            "verify": "Open the post and confirm the banner and link are still there, and that the link still carries utm_medium=cta_banner.",
+            "action": "Restore or fix whichever of the three verification finds broken.",
         })
 
     order = {"MAXIMUM": 0, "HIGH": 1, "MEDIUM": 2}
-    tasks.sort(key=lambda t: order.get(t["priority"], 3))
+    tasks.sort(key=lambda t: (order.get(t["priority"], 3), -t["_impact"]))
     for i, t in enumerate(tasks, 1):
         t["num"] = i
     return tasks
@@ -1130,10 +1322,14 @@ def _build_html_email(tasks, run_date, opportunity_count):
         if t["page"] and t["page"] != t["target"]:
             html.append(f'<div style="font-size:12px;color:#666;margin-bottom:6px;">'
                         f'{_html_escape(t["page"])}</div>')
-        html.append(f'<div style="font-size:13px;color:#333;margin-bottom:6px;">'
-                    f'<b>Action:</b> {_html_escape(t["action"])}</div>')
-        html.append(f'<div style="font-size:12px;color:#777;">'
-                    f'<b>Why:</b> {_html_escape(t["evidence"])}</div>')
+        html.append(f'<div style="font-size:13px;color:#333;margin-bottom:5px;">'
+                    f'<b>Evidence:</b> {_html_escape(t["evidence"])}</div>')
+        html.append(f'<div style="font-size:13px;color:#333;margin-bottom:5px;">'
+                    f'<b>Possible cause:</b> {_html_escape(t["hypothesis"])}</div>')
+        html.append(f'<div style="font-size:13px;color:#333;margin-bottom:5px;">'
+                    f'<b>Verify first:</b> {_html_escape(t["verify"])}</div>')
+        html.append(f'<div style="font-size:13px;color:#333;">'
+                    f'<b>Then:</b> {_html_escape(t["action"])}</div>')
         html.append('</div>')
 
     if opportunity_count:
@@ -1173,8 +1369,10 @@ def send_email(g1, g2, g3, g4, g5, g6, g7, g8, report_path, run_date):
             text_lines.append(f"    {t['target']}")
             if t["page"] and t["page"] != t["target"]:
                 text_lines.append(f"    {t['page']}")
-            text_lines.append(f"    Action: {t['action']}")
-            text_lines.append(f"    Why: {t['evidence']}")
+            text_lines.append(f"    Evidence: {t['evidence']}")
+            text_lines.append(f"    Possible cause: {t['hypothesis']}")
+            text_lines.append(f"    Verify first: {t['verify']}")
+            text_lines.append(f"    Then: {t['action']}")
             text_lines.append("")
         if opportunity_count:
             text_lines.append(f"Plus {opportunity_count} opportunity/visibility items "
@@ -1331,7 +1529,7 @@ def main():
     print_funnel_diagnostic(current)
 
     print("Rodando os 7 gatilhos...")
-    g1 = gatilho_1_vazamento_ctr(current, stats)
+    g1 = gatilho_1_vazamento_ctr(current, stats, seo_log_urls)
     g2 = gatilho_2_queda_precoce(current, stats)
     g3 = gatilho_3_query_nova(current, stats)
     g4 = gatilho_4_decaimento_posts(current, stats, seo_log_urls)
