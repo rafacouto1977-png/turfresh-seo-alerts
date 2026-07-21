@@ -920,21 +920,43 @@ def gatilho_7_marca(current_df, trailing_stats):
 # ===========================================================================
 G9_MIN_IMPRESSIONS = 50
 G9_MAX_POSITION = 30
+# So vale a pena tratar como cannibalizacao se a melhor pagina ja estiver
+# perto o suficiente de uma posicao boa para a briga interna importar. Se a
+# melhor pagina ja rankeia mal (ex: posicao 19), cannibalizacao nao e o
+# problema principal - tem coisa maior errada primeiro.
+G9_MAX_BEST_POSITION = 15
 
 
-def gatilho_9_canibalizacao(current_df, dead_set=None):
+def gatilho_9_canibalizacao(current_df, dead_set=None, seo_log_urls=None):
     """
     Para cada query, se 2+ paginas distintas rankeiam com volume real, isso
     e canibalizacao - o Google nao sabe qual pagina sua deveria vencer, e
     isso normalmente arrasta a posicao da melhor pagina pra baixo tambem.
+
+    Tres filtros aplicados depois que a producao mostrou ruido real:
+      - 'gardening' disparou com 5 paginas todas empatadas em posicao ~2 -
+        nao e uma pagina roubando de outra, e um termo generico aparecendo
+        em conteudo compartilhado (rodape, menu) em todo canto do site.
+      - 'turfresh' disparou com 9 paginas - e a marca. Toda pagina rankear
+        um pouco pro proprio nome do site e normal, nao e para "consolidar".
+      - 'artificial turf maintenance' disparou com a melhor pagina na
+        posicao 19 - cannibalizacao nao e o problema quando nem a melhor
+        pagina rankeia bem.
+
+    A regra que sobrou: so dispara se a query for comercial/local OU bater
+    com a keyword logada de alguma das paginas competindo (mesmo criterio
+    do Gatilho 1) - isso deixa passar casos legitimos como "artificial
+    grass for dogs" (que e a keyword logada de um post especifico) e barra
+    termos genericos incidentais como "gardening".
     """
     alerts = []
     if current_df.empty:
         return alerts
     dead_set = dead_set or set()
+    seo_log_urls = seo_log_urls or {}
 
     for query, grp in current_df.groupby("query"):
-        if query in dead_set:
+        if query in dead_set or is_brand(query):
             continue
         competing = grp[grp["impressions"] >= G9_MIN_IMPRESSIONS]
         competing = competing[competing["position"] <= G9_MAX_POSITION]
@@ -945,6 +967,22 @@ def gatilho_9_canibalizacao(current_df, dead_set=None):
         competing = competing.sort_values("position")
         best = competing.iloc[0]
         others = competing.iloc[1:]
+
+        if float(best["position"]) > G9_MAX_BEST_POSITION:
+            continue
+
+        if not is_commercial_local(query):
+            # sem padrao comercial - so vale se bater com a keyword logada
+            # de alguma pagina competindo (ex: post de blog dedicado)
+            relevant = False
+            for _, prow in competing.iterrows():
+                meta = seo_log_urls.get(norm_path(prow["page"]))
+                if meta and keyword_overlap_ratio(query, meta.get("keyword", ""),
+                                                   meta.get("meta_title", "")) >= 0.5:
+                    relevant = True
+                    break
+            if not relevant:
+                continue
 
         alerts.append({
             "gatilho": "9. Cannibalization",
@@ -1735,7 +1773,7 @@ def main():
     g5 = gatilho_5_sinal_vida(current, city_pages, run_date)
     g6 = gatilho_6_city_pages(current, stats, city_pages)
     g7 = gatilho_7_marca(current, stats)
-    g9 = gatilho_9_canibalizacao(current)
+    g9 = gatilho_9_canibalizacao(current, seo_log_urls=seo_log_urls)
 
     all_alerts = g1 + g2 + g3 + g4 + g5 + g6 + g7 + g9
     print(f"  G1 vazamento CTR: {len(g1)}")
