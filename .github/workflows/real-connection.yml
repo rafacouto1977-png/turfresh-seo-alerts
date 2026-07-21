@@ -29,4 +29,6 @@ jobs:
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
           GA4_PROPERTY_ID: ${{ secrets.GA4_PROPERTY_ID }}
+          GA4_CLIENT_EMAIL: ${{ secrets.GA4_CLIENT_EMAIL }}
+          GA4_PRIVATE_KEY: ${{ secrets.GA4_PRIVATE_KEY }}
         run: python scripts/turfresh_alert.py
