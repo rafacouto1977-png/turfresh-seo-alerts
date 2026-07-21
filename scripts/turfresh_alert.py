@@ -1192,15 +1192,27 @@ def get_ga4_client():
     a conta de servico sem acesso, devolve None em vez de derrubar o script
     inteiro. Os outros 7 gatilhos (GSC) nao dependem do GA4 e devem continuar
     funcionando mesmo se essa parte falhar.
+
+    Usa credenciais PROPRIAS (GA4_CLIENT_EMAIL/GA4_PRIVATE_KEY), diferentes
+    das do GSC - essa conta de servico vive no projeto guiamexico-seo-alerts,
+    nao no turfresh-seo-alerts, porque a conta pinsoda.com (que criou o
+    projeto da TurFresh) e gerenciada por uma politica de Workspace que
+    bloqueou a ativacao da API GA4 nesse projeto. Contornado usando um
+    projeto que ja tem a API liberada.
     """
     if not GA4_PROPERTY_ID:
         print("  GA4_PROPERTY_ID nao configurado - pulando Gatilho 8 (CTA banner).")
         return None
+    ga4_email = os.environ.get("GA4_CLIENT_EMAIL")
+    ga4_key = os.environ.get("GA4_PRIVATE_KEY")
+    if not ga4_email or not ga4_key:
+        print("  GA4_CLIENT_EMAIL ou GA4_PRIVATE_KEY nao configurados - pulando Gatilho 8.")
+        return None
     try:
         from google.analytics.data_v1beta import BetaAnalyticsDataClient
         creds = service_account.Credentials.from_service_account_info(
-            {"type": "service_account", "client_email": GSC_CLIENT_EMAIL,
-             "private_key": GSC_PRIVATE_KEY,
+            {"type": "service_account", "client_email": ga4_email,
+             "private_key": ga4_key,
              "token_uri": "https://oauth2.googleapis.com/token"},
             scopes=["https://www.googleapis.com/auth/analytics.readonly"])
         return BetaAnalyticsDataClient(credentials=creds)
