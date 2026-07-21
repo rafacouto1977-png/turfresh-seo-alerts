@@ -910,6 +910,131 @@ def gatilho_7_marca(current_df, trailing_stats):
     return alerts
 
 
+# ===========================================================================
+# GATILHO 9 - CANIBALIZACAO
+# Nao existia antes. Achado real: "artificial grass cleaning san jose"
+# rankeava em /california/san-jose/ (pos 1.7) E /california/bay-area/
+# (pos 7.7) ao mesmo tempo - G1 e G2 tratavam isso como dois problemas
+# separados quando e um problema estrutural so: duas paginas brigando
+# pela mesma query.
+# ===========================================================================
+G9_MIN_IMPRESSIONS = 50
+G9_MAX_POSITION = 30
+
+
+def gatilho_9_canibalizacao(current_df, dead_set=None):
+    """
+    Para cada query, se 2+ paginas distintas rankeiam com volume real, isso
+    e canibalizacao - o Google nao sabe qual pagina sua deveria vencer, e
+    isso normalmente arrasta a posicao da melhor pagina pra baixo tambem.
+    """
+    alerts = []
+    if current_df.empty:
+        return alerts
+    dead_set = dead_set or set()
+
+    for query, grp in current_df.groupby("query"):
+        if query in dead_set:
+            continue
+        competing = grp[grp["impressions"] >= G9_MIN_IMPRESSIONS]
+        competing = competing[competing["position"] <= G9_MAX_POSITION]
+        pages = competing["page"].unique()
+        if len(pages) < 2:
+            continue
+
+        competing = competing.sort_values("position")
+        best = competing.iloc[0]
+        others = competing.iloc[1:]
+
+        alerts.append({
+            "gatilho": "9. Cannibalization",
+            "query": query,
+            "pagina": best["page"],
+            "posicao": round(float(best["position"]), 1),
+            "impressoes_semana": int(competing["impressions"].sum()),
+            "n_paginas": len(pages),
+            "outras_paginas": " | ".join(f"{norm_path(p)} (pos {pos:.1f})"
+                                         for p, pos in zip(others["page"], others["position"])),
+            "motivo": (f"{len(pages)} of your own pages compete for this query. Best position "
+                      f"is {best['position']:.1f} on {norm_path(best['page'])}, but the other "
+                      f"{len(pages)-1} page(s) split impressions and likely hold the best page back."),
+            "confianca": "HIGH",
+        })
+
+    alerts.sort(key=lambda x: -x["impressoes_semana"])
+    return alerts
+
+
+# ===========================================================================
+# DETECTOR DE PADRAO SISTEMICO
+# Achado real: 8 city pages diferentes cairam entre 66% e 83% de impressao
+# na MESMA semana, todas com posicao estavel - muito estreito pra serem 8
+# problemas independentes. Isso junta esses casos numa descoberta so, em
+# vez de espalhar como N tarefas identicas.
+# ===========================================================================
+SYSTEMIC_MIN_PAGES = 3
+SYSTEMIC_DROP_BAND = 20   # pontos percentuais de largura da faixa considerada "o mesmo evento"
+
+
+def detect_systemic_pattern(g2, g6):
+    """
+    Junta alertas de G2 (queda precoce) e G6 (city page caindo) que
+    compartilham uma faixa de queda muito estreita, em paginas distintas,
+    na mesma semana - assinatura de um evento so (ex: uma mudanca de SERP
+    que afeta uma familia inteira de queries) em vez de N problemas
+    independentes. So agrupa se houver evidencia real de cluster; nao forca
+    juncao em alertas que nao se parecem.
+    """
+    candidates = []
+    for a in g2:
+        try:
+            drop = float(str(a.get("queda_pct", "0")).replace("%", ""))
+        except ValueError:
+            continue
+        candidates.append({"page": norm_path(a["pagina"]), "drop": drop,
+                           "impr": a.get("impressoes_semana", 0), "source": "G2",
+                           "query": a.get("query", "")})
+    for a in g6:
+        if a.get("gatilho") != "6. City Page Falling":
+            continue
+        media = a.get("media_impr_4sem", 0) or 0
+        impr = a.get("impressoes_semana", 0) or 0
+        if media <= 0:
+            continue
+        drop = (media - impr) / media * 100
+        candidates.append({"page": norm_path(a["pagina"]), "drop": drop,
+                           "impr": impr, "source": "G6", "query": ""})
+
+    if len(candidates) < SYSTEMIC_MIN_PAGES:
+        return None
+
+    candidates.sort(key=lambda c: c["drop"])
+    best_cluster = []
+    for c in candidates:
+        band = [x for x in candidates if abs(x["drop"] - c["drop"]) <= SYSTEMIC_DROP_BAND / 2]
+        distinct_pages = {x["page"] for x in band}
+        if len(distinct_pages) > len({x["page"] for x in best_cluster}):
+            best_cluster = band
+
+    distinct_pages = {c["page"] for c in best_cluster}
+    if len(distinct_pages) < SYSTEMIC_MIN_PAGES:
+        return None
+
+    drops = [c["drop"] for c in best_cluster]
+    return {
+        "gatilho": "SYSTEMIC. Site-wide visibility drop",
+        "n_pages": len(distinct_pages),
+        "pages": sorted(distinct_pages),
+        "drop_range": f"{min(drops):.0f}%-{max(drops):.0f}%",
+        "total_impressions": sum(c["impr"] for c in best_cluster),
+        "motivo": (f"{len(distinct_pages)} different pages dropped {min(drops):.0f}%-"
+                  f"{max(drops):.0f}% in impressions this week, all with stable position. "
+                  f"That range is too tight to be independent problems - this is very "
+                  f"likely one event (a new AI Overview or SERP feature rollout affecting "
+                  f"this query family) hitting all of them at once."),
+    }
+
+
 # RADAR - VISIBILIDADE COMPLETA (nao dispara alerta, so mostra o estado)
 # ===========================================================================
 def build_radar(current_df, trailing_stats, all_alerts):
@@ -1044,21 +1169,28 @@ def _sheet(wb, title, rows, columns):
     return ws
 
 
-def write_report(g1, g2, g3, g4, g5, g6, g7, g8, radar, run_date, path="turfresh_alertas.xlsx"):
+def write_report(g1, g2, g3, g4, g5, g6, g7, g8, g9, systemic, radar, run_date, path="turfresh_alertas.xlsx"):
     wb = Workbook()
     ws = wb.active
     ws.title = "Summary"
     ws["A1"] = f"TurFresh - Weekly Alerts - {run_date.isoformat()}"
     ws["A1"].font = Font(bold=True, size=14)
-    ws["A3"] = f"Trigger 1 (CTR gap): {len(g1)}"
-    ws["A4"] = f"Trigger 2 (early impression drop): {len(g2)}"
-    ws["A5"] = f"Trigger 3 (emerging query): {len(g3)}"
-    ws["A6"] = f"Trigger 4 (optimized post decay): {len(g4)}"
-    ws["A7"] = f"Trigger 5 (content life signal): {len(g5)}"
-    ws["A8"] = f"Trigger 6 (city pages): {len(g6)}"
-    ws["A9"] = f"Trigger 7 (brand): {len(g7)}"
-    ws["A10"] = f"Trigger 8 (blog CTA): {len(g8)} campaigns with a session this week"
-    ws.column_dimensions["A"].width = 45
+    row_n = 3
+    if systemic:
+        ws[f"A{row_n}"] = (f"SYSTEMIC PATTERN: {systemic['n_pages']} pages dropped "
+                           f"{systemic['drop_range']} in impressions this week - see below.")
+        ws[f"A{row_n}"].font = Font(bold=True, color="D32F2F")
+        row_n += 1
+    ws[f"A{row_n}"] = f"Trigger 1 (CTR gap): {len(g1)}"; row_n += 1
+    ws[f"A{row_n}"] = f"Trigger 2 (early impression drop): {len(g2)}"; row_n += 1
+    ws[f"A{row_n}"] = f"Trigger 3 (emerging query): {len(g3)}"; row_n += 1
+    ws[f"A{row_n}"] = f"Trigger 4 (optimized post decay): {len(g4)}"; row_n += 1
+    ws[f"A{row_n}"] = f"Trigger 5 (content life signal): {len(g5)}"; row_n += 1
+    ws[f"A{row_n}"] = f"Trigger 6 (city pages): {len(g6)}"; row_n += 1
+    ws[f"A{row_n}"] = f"Trigger 7 (brand): {len(g7)}"; row_n += 1
+    ws[f"A{row_n}"] = f"Trigger 8 (blog CTA): {len(g8)} campaigns with a session this week"; row_n += 1
+    ws[f"A{row_n}"] = f"Trigger 9 (cannibalization): {len(g9)}"; row_n += 1
+    ws.column_dimensions["A"].width = 55
 
     G1_COLS = [("query","Query",40),("pagina","Page",38),("posicao","Pos",8),
                ("impressoes_semana","Impr/wk",10),("ctr_semana","CTR",9),
@@ -1105,6 +1237,12 @@ def write_report(g1, g2, g3, g4, g5, g6, g7, g8, radar, run_date, path="turfresh
                ("sessoes_semana_anterior","Sessions previous wk",18),
                ("variacao","Change",12),("alerta","Alert",55)]
     _sheet(wb, "G8 Blog CTA", g8, G8_COLS)
+
+    G9_COLS = [("query","Query",38),("pagina","Best page",38),("posicao","Pos",8),
+               ("n_paginas","# pages",9),("impressoes_semana","Impr/wk",10),
+               ("outras_paginas","Competing pages",55),("confianca","Confidence",11),
+               ("motivo","Reason",60)]
+    _sheet(wb, "G9 Cannibalization", g9, G9_COLS)
 
     RADAR_COLS = [("pagina","Page",42),("impressoes_semana","Impr/wk",11),
                   ("clicks_semana","Clicks/wk",11),("posicao","Pos",8),
@@ -1188,6 +1326,11 @@ GUIDANCE_BY_TRIGGER = {
         "verify": "Check the Knowledge Panel and the live SERP for the brand term for a new feature sitting above the organic result.",
         "action": "If a feature is confirmed, there's no direct fix - this is worth tracking. If nothing has changed on the SERP, treat as an open question, not a confirmed cause.",
     },
+    "9. Cannibalization": {
+        "hypothesis": "Two or more of your own pages are competing for the same query, which typically holds the best-ranking page back and confuses which page Google should show.",
+        "verify": "Decide which page should own this query - usually the one already ranking best or most specific to the intent.",
+        "action": "Consolidate the weaker page into the stronger one (301 redirect or merge content), or clearly differentiate them if both should legitimately exist.",
+    },
 }
 
 URGENT_TRIGGER_TYPES = set(GUIDANCE_BY_TRIGGER.keys())
@@ -1207,9 +1350,9 @@ def _task_impact(alert):
     return 0.0
 
 
-def build_urgent_tasks(g1, g2, g3, g4, g5, g6, g7, g8):
+def build_urgent_tasks(g1, g2, g3, g4, g5, g6, g7, g8, g9=None, systemic=None):
     """
-    Filters the 8 triggers down to only what represents a real problem -
+    Filters the 9 triggers down to only what represents a real problem -
     the subset Rafael turns into ClickUp tasks. Opportunity/good-news
     signals (new queries, pages rising, positive life signals, and G8 rows
     without a break) are left out of this list on purpose; they still live
@@ -1225,15 +1368,47 @@ def build_urgent_tasks(g1, g2, g3, g4, g5, g6, g7, g8):
     top of its tier - a confirmed, already-diagnosed problem is the most
     actionable item on the list, more useful to act on first than a bigger
     but unconfirmed one.
-    """
-    tasks = []
 
-    for alert in g1 + g2 + g4 + g5 + g6 + g7:
+    If a systemic pattern was detected (many pages dropping in the same
+    tight range, same week), the individual G2/G6 alerts for those pages
+    are folded into ONE task instead of appearing as N near-duplicates -
+    that was real noise found in production: 8 city pages each showing up
+    as a separate "check this page" task when they were one event.
+    """
+    g9 = g9 or []
+    tasks = []
+    absorbed_pages = set(systemic["pages"]) if systemic else set()
+
+    if systemic:
+        tasks.append({
+            "priority": "MAXIMUM",
+            "_impact": systemic["total_impressions"] + 2_000_000,
+            "trigger": systemic["gatilho"],
+            "target": f"{systemic['n_pages']} pages ({systemic['drop_range']} impression drop)",
+            "page": ", ".join(systemic["pages"][:5]) + (
+                f" +{len(systemic['pages'])-5} more" if len(systemic["pages"]) > 5 else ""),
+            "evidence": systemic["motivo"],
+            "hypothesis": ("A single event most likely explains all of these at once - check "
+                          "one query from this group live before treating this as several "
+                          "separate problems."),
+            "verify": ("Search one or two of the affected queries live. Look for a new AI "
+                      "Overview, local pack change, or other feature that wasn't there before, "
+                      "and confirm it appears across more than one of the affected queries."),
+            "action": ("If confirmed as one event, there's likely no per-page fix - track it "
+                      "as a single trend, not N separate tasks. If the affected queries turn "
+                      "out unrelated on closer look, treat each page individually instead."),
+        })
+
+    for alert in g1 + g2 + g4 + g5 + g6 + g7 + g9:
         trigger = alert.get("gatilho")
         if trigger not in URGENT_TRIGGER_TYPES:
             continue
         if alert.get("actionable") is False:
             continue   # diagnosis already concluded there's no real fix - not a task
+        if trigger in ("2. Early Impression Drop", "6. City Page Falling") and \
+                norm_path(alert.get("pagina", "")) in absorbed_pages:
+            continue   # already represented in the systemic task above
+
         priority = "MAXIMUM" if alert.get("urgencia") == "MAXIMUM" else (
             "HIGH" if alert.get("confianca") == "HIGH" or alert.get("urgencia") == "HIGH"
             else "MEDIUM")
@@ -1365,17 +1540,18 @@ def _build_html_email(tasks, run_date, opportunity_count):
     return "\n".join(html)
 
 
-def send_email(g1, g2, g3, g4, g5, g6, g7, g8, report_path, run_date):
+def send_email(g1, g2, g3, g4, g5, g6, g7, g8, g9, systemic, report_path, run_date):
     import smtplib
     from email.message import EmailMessage
 
-    tasks = build_urgent_tasks(g1, g2, g3, g4, g5, g6, g7, g8)
+    tasks = build_urgent_tasks(g1, g2, g3, g4, g5, g6, g7, g8, g9, systemic)
 
     # everything that did NOT become a task: opportunities and good news,
     # kept out of the email on purpose, still counted so Rafael knows the
     # spreadsheet has more context even when the email is short.
-    total_all = len(g1) + len(g2) + len(g3) + len(g4) + len(g5) + len(g6) + len(g7) + len(g8)
-    opportunity_count = total_all - len(tasks)
+    total_all = (len(g1) + len(g2) + len(g3) + len(g4) + len(g5) + len(g6)
+                + len(g7) + len(g8) + len(g9))
+    opportunity_count = max(total_all - len(tasks), 0)
 
     maximum_tasks = [t for t in tasks if t["priority"] == "MAXIMUM"]
 
@@ -1551,7 +1727,7 @@ def main():
 
     print_funnel_diagnostic(current)
 
-    print("Rodando os 7 gatilhos...")
+    print("Rodando os 9 gatilhos...")
     g1 = gatilho_1_vazamento_ctr(current, stats, seo_log_urls)
     g2 = gatilho_2_queda_precoce(current, stats)
     g3 = gatilho_3_query_nova(current, stats)
@@ -1559,8 +1735,9 @@ def main():
     g5 = gatilho_5_sinal_vida(current, city_pages, run_date)
     g6 = gatilho_6_city_pages(current, stats, city_pages)
     g7 = gatilho_7_marca(current, stats)
+    g9 = gatilho_9_canibalizacao(current)
 
-    all_alerts = g1 + g2 + g3 + g4 + g5 + g6 + g7
+    all_alerts = g1 + g2 + g3 + g4 + g5 + g6 + g7 + g9
     print(f"  G1 vazamento CTR: {len(g1)}")
     print(f"  G2 queda precoce: {len(g2)}")
     print(f"  G3 query nova: {len(g3)}")
@@ -1568,7 +1745,13 @@ def main():
     print(f"  G5 sinal de vida: {len(g5)}")
     print(f"  G6 city pages: {len(g6)}")
     print(f"  G7 marca: {len(g7)}")
+    print(f"  G9 canibalizacao: {len(g9)}")
     print(f"  TOTAL: {len(all_alerts)} alertas\n")
+
+    systemic = detect_systemic_pattern(g2, g6)
+    if systemic:
+        print(f"PADRAO SISTEMICO DETECTADO: {systemic['n_pages']} paginas, "
+              f"faixa de queda {systemic['drop_range']}\n")
 
     radar = build_radar(current, stats, all_alerts)
     print(f"Radar: {len(radar)} paginas com volume real\n")
@@ -1582,10 +1765,10 @@ def main():
     g8 = gatilho_8_cta_banner(current_cta, previous_cta)
     print(f"  G8 CTA banner: {len(g8)} campanhas com dado\n")
 
-    report_path = write_report(g1, g2, g3, g4, g5, g6, g7, g8, radar, run_date)
+    report_path = write_report(g1, g2, g3, g4, g5, g6, g7, g8, g9, systemic, radar, run_date)
     print(f"Relatorio: {report_path}\n")
 
-    send_email(g1, g2, g3, g4, g5, g6, g7, g8, report_path, run_date)
+    send_email(g1, g2, g3, g4, g5, g6, g7, g8, g9, systemic, report_path, run_date)
 
 
 if __name__ == "__main__":
