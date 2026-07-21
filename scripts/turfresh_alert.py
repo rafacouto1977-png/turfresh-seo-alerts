@@ -380,16 +380,16 @@ def gatilho_1_vazamento_ctr(current_df, trailing_stats):
             continue
 
         if by_absolute and by_drop:
-            motivo = f"CTR absoluto de {ctr*100:.2f}% (abaixo do piso de 1%) E caiu {drop_pct*100:.0f}% vs media"
+            motivo = f"Absolute CTR of {ctr*100:.2f}% (below the 1% floor) AND dropped {drop_pct*100:.0f}% vs average"
         elif by_absolute:
-            motivo = f"CTR de {ctr*100:.2f}%, abaixo do piso absoluto de 1% para posicao {pos:.1f}"
+            motivo = f"CTR of {ctr*100:.2f}%, below the 1% absolute floor for position {pos:.1f}"
         else:
-            motivo = f"CTR caiu {drop_pct*100:.0f}% vs a media das 4 semanas anteriores"
+            motivo = f"CTR dropped {drop_pct*100:.0f}% vs the previous 4-week average"
 
-        confianca = "ALTA" if (st and st["confiavel"]) else "BAIXA (pouco historico)"
+        confianca = "HIGH" if (st and st["confiavel"]) else "LOW (limited history)"
 
         alerts.append({
-            "gatilho": "1. Vazamento de CTR",
+            "gatilho": "1. CTR Gap",
             "query": query,
             "pagina": page,
             "posicao": round(pos, 1),
@@ -397,7 +397,7 @@ def gatilho_1_vazamento_ctr(current_df, trailing_stats):
             "clicks_semana": int(clicks),
             "ctr_semana": f"{ctr*100:.2f}%",
             "media_ctr_4sem": (f"{(st['media_clicks']/st['media_impr'])*100:.2f}%"
-                               if st and st["media_impr"] > 0 else "sem historico"),
+                               if st and st["media_impr"] > 0 else "no history"),
             "motivo": motivo,
             "confianca": confianca,
         })
@@ -445,17 +445,17 @@ def gatilho_2_queda_precoce(current_df, trailing_stats):
             continue   # posicao tambem mudou - nao e o padrao "Google mostrando menos"
 
         alerts.append({
-            "gatilho": "2. Queda de impressoes precoce",
+            "gatilho": "2. Early Impression Drop",
             "query": query, "pagina": page, "posicao": round(pos, 1),
             "posicao_media_4sem": round(st["media_position"], 1),
             "impressoes_semana": int(impr),
             "media_impr_4sem": round(st["media_impr"], 0),
             "queda_pct": f"{drop*100:.0f}%",
-            "motivo": (f"Impressoes cairam {drop*100:.0f}% vs media (posicao ficou "
-                      f"estavel: {pos:.1f} vs media {st['media_position']:.1f}). "
-                      f"Google esta mostrando menos essa pagina/query, nao um "
-                      f"problema de ranking."),
-            "confianca": "ALTA",
+            "motivo": (f"Impressions dropped {drop*100:.0f}% vs average (position stayed "
+                      f"stable: {pos:.1f} vs average {st['media_position']:.1f}). "
+                      f"Google is showing this page/query less, not a "
+                      f"ranking problem."),
+            "confianca": "HIGH",
         })
 
     alerts.sort(key=lambda x: -x["impressoes_semana"])
@@ -491,13 +491,13 @@ def gatilho_3_query_nova(current_df, trailing_stats):
         pos = current_df[current_df["query"] == query].iloc[0]["position"]
 
         alerts.append({
-            "gatilho": "3. Query nova emergindo",
+            "gatilho": "3. Emerging New Query",
             "query": query, "pagina": page, "posicao": round(float(pos), 1),
             "impressoes_semana": int(impr),
-            "tipo": "PERGUNTA - candidata a calendario AI" if pergunta else "comum",
-            "motivo": (f"Query nao existia nas 4 semanas anteriores. "
-                      f"{'E uma pergunta, boa candidata a conteudo de AI Overview.' if pergunta else ''}"),
-            "confianca": "ALTA" if impr >= 200 else "MEDIA",
+            "tipo": "QUESTION - AI content calendar candidate" if pergunta else "standard",
+            "motivo": (f"Query did not exist in the previous 4 weeks. "
+                      f"{'It is a question, a good candidate for AI Overview content.' if pergunta else ''}"),
+            "confianca": "HIGH" if impr >= 200 else "MEDIUM",
         })
 
     alerts.sort(key=lambda x: -x["impressoes_semana"])
@@ -544,7 +544,7 @@ def gatilho_4_decaimento_posts(current_df, trailing_stats, seo_log_urls):
             continue
 
         alerts.append({
-            "gatilho": "4. Decaimento posts otimizados",
+            "gatilho": "4. Optimized Post Decay",
             "pagina": path,
             "clicks_semana": int(clicks_now),
             "media_clicks_4sem": round(media_clicks, 1),
@@ -552,8 +552,8 @@ def gatilho_4_decaimento_posts(current_df, trailing_stats, seo_log_urls):
             "posicao": round(float(page_pos.get(path, 0)), 1),
             "queda_pct": f"{drop*100:.0f}%",
             "data_otimizacao": seo_log_urls.get(path, ""),
-            "motivo": f"Clicks cairam {drop*100:.0f}% vs a media das 4 semanas anteriores.",
-            "confianca": "ALTA" if media_clicks >= 40 else "MEDIA",
+            "motivo": f"Clicks dropped {drop*100:.0f}% vs the previous 4-week average.",
+            "confianca": "HIGH" if media_clicks >= 40 else "MEDIUM",
         })
 
     alerts.sort(key=lambda x: -x["media_clicks_4sem"])
@@ -596,20 +596,20 @@ def gatilho_5_sinal_vida(current_df, city_pages, run_date):
 
         if dias_desde_publicacao <= 7 and impr >= G5_POSITIVE_MIN_IMPRESSIONS:
             alerts.append({
-                "gatilho": "5. Sinal de vida (positivo)",
+                "gatilho": "5. Content Life Signal (Positive)",
                 "pagina": path, "dias_desde_publicacao": dias_desde_publicacao,
                 "impressoes_semana": int(impr),
-                "motivo": f"Primeira semana com {int(impr)} impressoes - Google comecou a testar a pagina.",
-                "confianca": "ALTA",
+                "motivo": f"First week with {int(impr)} impressions - Google has started testing the page.",
+                "confianca": "HIGH",
             })
         elif dias_desde_publicacao >= G5_NEGATIVE_MIN_DAYS and impr == 0:
             alerts.append({
-                "gatilho": "5. Sinal de vida (negativo)",
+                "gatilho": "5. Content Life Signal (Negative)",
                 "pagina": path, "dias_desde_publicacao": dias_desde_publicacao,
                 "impressoes_semana": 0,
-                "motivo": (f"Publicada ha {dias_desde_publicacao} dias, ZERO impressoes. "
-                          f"Possivel problema de indexacao - checar no GSC (Inspecao de URL)."),
-                "confianca": "ALTA",
+                "motivo": (f"Published {dias_desde_publicacao} days ago, ZERO impressions. "
+                          f"Possible indexing issue - check in GSC (URL Inspection)."),
+                "confianca": "HIGH",
             })
 
     return alerts
@@ -679,29 +679,29 @@ def gatilho_6_city_pages(current_df, trailing_stats, city_pages):
         if media < G6_NEW_PAGE_THRESHOLD:
             if impr_now >= G6_RISE_FIRST_SIGNAL:
                 alerts.append({
-                    "gatilho": "6. City page subindo",
+                    "gatilho": "6. City Page Rising",
                     "pagina": path, "impressoes_semana": int(impr_now),
                     "media_impr_4sem": round(media, 0),
-                    "motivo": f"Pagina nova/pequena comecou a rankear: {int(impr_now)} impressoes essa semana.",
-                    "confianca": "MEDIA",
+                    "motivo": f"New/small page has started ranking: {int(impr_now)} impressions this week.",
+                    "confianca": "MEDIUM",
                 })
         else:
             variacao = (impr_now - media) / media
             if variacao >= G6_RISE_RATIO:
                 alerts.append({
-                    "gatilho": "6. City page subindo",
+                    "gatilho": "6. City Page Rising",
                     "pagina": path, "impressoes_semana": int(impr_now),
                     "media_impr_4sem": round(media, 0),
-                    "motivo": f"Impressoes subiram {variacao*100:.0f}% vs media de 4 semanas.",
-                    "confianca": "ALTA",
+                    "motivo": f"Impressions rose {variacao*100:.0f}% vs the 4-week average.",
+                    "confianca": "HIGH",
                 })
             elif -variacao >= G6_FALL_RATIO and media >= G6_FALL_MIN_AVG:
                 alerts.append({
-                    "gatilho": "6. City page caindo",
+                    "gatilho": "6. City Page Falling",
                     "pagina": path, "impressoes_semana": int(impr_now),
                     "media_impr_4sem": round(media, 0),
-                    "motivo": f"Impressoes cairam {-variacao*100:.0f}% vs media de 4 semanas.",
-                    "confianca": "ALTA",
+                    "motivo": f"Impressions dropped {-variacao*100:.0f}% vs the 4-week average.",
+                    "confianca": "HIGH",
                 })
 
     alerts.sort(key=lambda x: -x["impressoes_semana"])
@@ -749,17 +749,17 @@ def gatilho_7_marca(current_df, trailing_stats):
             pos_drop = pos - st["media_position"]
             if pos_drop >= G7_POSITION_DROP_ALERT:
                 alerts.append({
-                    "gatilho": "7. Marca - POSICAO CAINDO",
+                    "gatilho": "7. Brand - POSITION DROPPING",
                     "query": query, "pagina": page, "posicao": round(pos, 1),
                     "posicao_media_4sem": round(st["media_position"], 1),
                     "impressoes_semana": int(impr),
-                    "motivo": (f"Posicao da marca caiu de {st['media_position']:.1f} para "
-                              f"{pos:.1f}. Alguem pode estar superando voce na busca do "
-                              f"seu proprio nome - verificar manualmente com urgencia."),
-                    "confianca": "ALTA",
-                    "urgencia": "MAXIMA",
+                    "motivo": (f"Brand position dropped from {st['media_position']:.1f} to "
+                              f"{pos:.1f}. Someone may be outranking you on your own "
+                              f"name - check manually as a priority."),
+                    "confianca": "HIGH",
+                    "urgencia": "MAXIMUM",
                 })
-                continue   # nao precisa checar o outro motivo tambem
+                continue   # no need to also check the other trigger
 
         # A) volume caindo, posicao estavel
         if not st["confiavel"] or st["media_impr"] < G7_MIN_AVG_IMPRESSIONS:
@@ -772,17 +772,17 @@ def gatilho_7_marca(current_df, trailing_stats):
             continue
 
         alerts.append({
-            "gatilho": "7. Marca - trafego caindo",
+            "gatilho": "7. Brand - Traffic Dropping",
             "query": query, "pagina": page, "posicao": round(pos, 1),
             "impressoes_semana": int(impr), "media_impr_4sem": round(st["media_impr"], 0),
-            "motivo": (f"Impressoes de marca cairam {drop*100:.0f}% vs media, posicao "
-                      f"estavel. Google mostrando menos a marca - checar Knowledge Panel, "
-                      f"GBP, ou AI Overview no lugar do seu site."),
-            "confianca": "ALTA",
-            "urgencia": "ALTA",
+            "motivo": (f"Brand impressions dropped {drop*100:.0f}% vs average, position "
+                      f"stable. Google is showing the brand less - check Knowledge Panel, "
+                      f"GBP, or an AI Overview appearing in your site's place."),
+            "confianca": "HIGH",
+            "urgencia": "HIGH",
         })
 
-    alerts.sort(key=lambda x: (x.get("urgencia") != "MAXIMA", -x["impressoes_semana"]))
+    alerts.sort(key=lambda x: (x.get("urgencia") != "MAXIMUM", -x["impressoes_semana"]))
     return alerts
 
 
@@ -907,11 +907,11 @@ def _sheet(wb, title, rows, columns):
         for ci, (key, _, _) in enumerate(columns, 1):
             cell = ws.cell(ri, ci, row.get(key, ""))
             cell.alignment = Alignment(wrap_text=True, vertical="top")
-            if key == "urgencia" and row.get("urgencia") == "MAXIMA":
+            if key == "urgencia" and row.get("urgencia") == "MAXIMUM":
                 cell.fill = RED
                 cell.font = Font(bold=True)
             elif key == "confianca":
-                fill = {"ALTA": GREEN, "MEDIA": YELLOW, "BAIXA": ORANGE}.get(row.get("confianca"))
+                fill = {"HIGH": GREEN, "MEDIUM": YELLOW, "LOW": ORANGE}.get(row.get("confianca"))
                 if fill:
                     cell.fill = fill
     ws.freeze_panes = "A2"
@@ -923,69 +923,69 @@ def _sheet(wb, title, rows, columns):
 def write_report(g1, g2, g3, g4, g5, g6, g7, g8, radar, run_date, path="turfresh_alertas.xlsx"):
     wb = Workbook()
     ws = wb.active
-    ws.title = "Resumo"
-    ws["A1"] = f"TurFresh - Alertas Semanais - {run_date.isoformat()}"
+    ws.title = "Summary"
+    ws["A1"] = f"TurFresh - Weekly Alerts - {run_date.isoformat()}"
     ws["A1"].font = Font(bold=True, size=14)
-    ws["A3"] = f"Gatilho 1 (vazamento CTR): {len(g1)}"
-    ws["A4"] = f"Gatilho 2 (queda precoce): {len(g2)}"
-    ws["A5"] = f"Gatilho 3 (query nova): {len(g3)}"
-    ws["A6"] = f"Gatilho 4 (decaimento posts): {len(g4)}"
-    ws["A7"] = f"Gatilho 5 (sinal de vida): {len(g5)}"
-    ws["A8"] = f"Gatilho 6 (city pages): {len(g6)}"
-    ws["A9"] = f"Gatilho 7 (marca): {len(g7)}"
-    ws["A10"] = f"Gatilho 8 (CTA de blog): {len(g8)} campanhas com sessao essa semana"
+    ws["A3"] = f"Trigger 1 (CTR gap): {len(g1)}"
+    ws["A4"] = f"Trigger 2 (early impression drop): {len(g2)}"
+    ws["A5"] = f"Trigger 3 (emerging query): {len(g3)}"
+    ws["A6"] = f"Trigger 4 (optimized post decay): {len(g4)}"
+    ws["A7"] = f"Trigger 5 (content life signal): {len(g5)}"
+    ws["A8"] = f"Trigger 6 (city pages): {len(g6)}"
+    ws["A9"] = f"Trigger 7 (brand): {len(g7)}"
+    ws["A10"] = f"Trigger 8 (blog CTA): {len(g8)} campaigns with a session this week"
     ws.column_dimensions["A"].width = 45
 
-    G1_COLS = [("query","Query",40),("pagina","Pagina",38),("posicao","Pos",8),
-               ("impressoes_semana","Impr/sem",10),("ctr_semana","CTR",9),
-               ("media_ctr_4sem","CTR medio 4sem",13),("confianca","Confianca",11),
-               ("motivo","Motivo",60)]
-    _sheet(wb, "G1 Vazamento CTR", g1, G1_COLS)
+    G1_COLS = [("query","Query",40),("pagina","Page",38),("posicao","Pos",8),
+               ("impressoes_semana","Impr/wk",10),("ctr_semana","CTR",9),
+               ("media_ctr_4sem","4wk avg CTR",13),("confianca","Confidence",11),
+               ("motivo","Reason",60)]
+    _sheet(wb, "G1 CTR Gap", g1, G1_COLS)
 
-    G2_COLS = [("query","Query",40),("pagina","Pagina",38),("posicao","Pos",8),
-               ("posicao_media_4sem","Pos media 4sem",13),
-               ("impressoes_semana","Impr/sem",10),("media_impr_4sem","Media 4sem",12),
-               ("queda_pct","Queda",9),("confianca","Confianca",11),("motivo","Motivo",60)]
-    _sheet(wb, "G2 Queda Precoce", g2, G2_COLS)
+    G2_COLS = [("query","Query",40),("pagina","Page",38),("posicao","Pos",8),
+               ("posicao_media_4sem","4wk avg pos",13),
+               ("impressoes_semana","Impr/wk",10),("media_impr_4sem","4wk avg",12),
+               ("queda_pct","Drop",9),("confianca","Confidence",11),("motivo","Reason",60)]
+    _sheet(wb, "G2 Early Drop", g2, G2_COLS)
 
-    G3_COLS = [("query","Query",40),("pagina","Pagina",38),("posicao","Pos",8),
-               ("impressoes_semana","Impr/sem",10),("tipo","Tipo",28),
-               ("confianca","Confianca",11),("motivo","Motivo",55)]
-    _sheet(wb, "G3 Query Nova", g3, G3_COLS)
+    G3_COLS = [("query","Query",40),("pagina","Page",38),("posicao","Pos",8),
+               ("impressoes_semana","Impr/wk",10),("tipo","Type",28),
+               ("confianca","Confidence",11),("motivo","Reason",55)]
+    _sheet(wb, "G3 New Query", g3, G3_COLS)
 
-    G4_COLS = [("pagina","Pagina",42),("clicks_semana","Clicks/sem",11),
-               ("media_clicks_4sem","Media 4sem",12),("impressoes_semana","Impr/sem",10),
-               ("posicao","Pos",8),("queda_pct","Queda",9),
-               ("data_otimizacao","Data otim.",11),("confianca","Confianca",11),
-               ("motivo","Motivo",55)]
-    _sheet(wb, "G4 Posts Decaindo", g4, G4_COLS)
+    G4_COLS = [("pagina","Page",42),("clicks_semana","Clicks/wk",11),
+               ("media_clicks_4sem","4wk avg",12),("impressoes_semana","Impr/wk",10),
+               ("posicao","Pos",8),("queda_pct","Drop",9),
+               ("data_otimizacao","Optimized on",11),("confianca","Confidence",11),
+               ("motivo","Reason",55)]
+    _sheet(wb, "G4 Post Decay", g4, G4_COLS)
 
-    G5_COLS = [("pagina","Pagina",42),("dias_desde_publicacao","Dias",8),
-               ("impressoes_semana","Impr/sem",10),("confianca","Confianca",11),
-               ("motivo","Motivo",65)]
-    _sheet(wb, "G5 Sinal de Vida", g5, G5_COLS)
+    G5_COLS = [("pagina","Page",42),("dias_desde_publicacao","Days",8),
+               ("impressoes_semana","Impr/wk",10),("confianca","Confidence",11),
+               ("motivo","Reason",65)]
+    _sheet(wb, "G5 Life Signal", g5, G5_COLS)
 
-    G6_COLS = [("gatilho","Direcao",22),("pagina","Pagina",42),
-               ("impressoes_semana","Impr/sem",10),("media_impr_4sem","Media 4sem",12),
-               ("confianca","Confianca",11),("motivo","Motivo",60)]
+    G6_COLS = [("gatilho","Direction",22),("pagina","Page",42),
+               ("impressoes_semana","Impr/wk",10),("media_impr_4sem","4wk avg",12),
+               ("confianca","Confidence",11),("motivo","Reason",60)]
     _sheet(wb, "G6 City Pages", g6, G6_COLS)
 
-    G7_COLS = [("urgencia","Urgencia",10),("gatilho","Tipo",25),("query","Query",30),
-               ("pagina","Pagina",38),("posicao","Pos",8),
-               ("posicao_media_4sem","Pos media 4sem",13),
-               ("impressoes_semana","Impr/sem",10),("confianca","Confianca",11),
-               ("motivo","Motivo",60)]
-    _sheet(wb, "G7 Marca", g7, G7_COLS)
+    G7_COLS = [("urgencia","Urgency",10),("gatilho","Type",25),("query","Query",30),
+               ("pagina","Page",38),("posicao","Pos",8),
+               ("posicao_media_4sem","4wk avg pos",13),
+               ("impressoes_semana","Impr/wk",10),("confianca","Confidence",11),
+               ("motivo","Reason",60)]
+    _sheet(wb, "G7 Brand", g7, G7_COLS)
 
-    G8_COLS = [("campanha","Campanha (post)",42),("sessoes_semana","Sessoes essa semana",16),
-               ("sessoes_semana_anterior","Sessoes sem. anterior",18),
-               ("variacao","Variacao",12),("alerta","Alerta",55)]
-    _sheet(wb, "G8 CTA Blog", g8, G8_COLS)
+    G8_COLS = [("campanha","Campaign (post)",42),("sessoes_semana","Sessions this week",16),
+               ("sessoes_semana_anterior","Sessions previous wk",18),
+               ("variacao","Change",12),("alerta","Alert",55)]
+    _sheet(wb, "G8 Blog CTA", g8, G8_COLS)
 
-    RADAR_COLS = [("pagina","Pagina",42),("impressoes_semana","Impr/sem",11),
-                  ("clicks_semana","Clicks/sem",11),("posicao","Pos",8),
-                  ("media_impr_4sem","Media 4sem",12),("tendencia","Tendencia",11),
-                  ("gatilhos_ativos","Gatilhos ativos",35)]
+    RADAR_COLS = [("pagina","Page",42),("impressoes_semana","Impr/wk",11),
+                  ("clicks_semana","Clicks/wk",11),("posicao","Pos",8),
+                  ("media_impr_4sem","4wk avg",12),("tendencia","Trend",11),
+                  ("gatilhos_ativos","Active triggers",35)]
     _sheet(wb, "Radar", radar, RADAR_COLS)
 
     wb.save(path)
@@ -1006,13 +1006,13 @@ CTA_UTM_MEDIUM = "cta_banner"
 MAX_ITEMS_PER_SECTION = 8   # o e-mail mostra o topo; a planilha tem a lista inteira
 
 GATILHO_INFO = [
-    ("g1", "Vazamento de CTR", "#FCE4D6"),
-    ("g2", "Queda de impressoes precoce", "#FFF2CC"),
-    ("g3", "Query nova emergindo", "#DDEEFF"),
-    ("g4", "Decaimento de posts otimizados", "#FCE4D6"),
-    ("g5", "Sinal de vida de conteudo novo", "#DDEEFF"),
-    ("g6", "City pages (subindo/caindo)", "#FFF2CC"),
-    ("g7", "Trafego de marca", "#FFF2CC"),
+    ("g1", "CTR Gap", "#FCE4D6"),
+    ("g2", "Early Impression Drop", "#FFF2CC"),
+    ("g3", "Emerging New Query", "#DDEEFF"),
+    ("g4", "Optimized Post Decay", "#FCE4D6"),
+    ("g5", "New Content Life Signal", "#DDEEFF"),
+    ("g6", "City Pages (Rising/Falling)", "#FFF2CC"),
+    ("g7", "Brand Traffic", "#FFF2CC"),
 ]
 
 
@@ -1039,25 +1039,25 @@ def _build_html_email(data, run_date, total, marca_maxima, g8):
                 "font-family:Arial,Helvetica,sans-serif;font-size:13px;")
 
     html = [f'<div style="font-family:Arial,Helvetica,sans-serif;max-width:720px;">']
-    html.append(f'<h2 style="color:#1F3864;margin-bottom:4px;">TurFresh - Alertas Semanais</h2>')
+    html.append(f'<h2 style="color:#1F3864;margin-bottom:4px;">TurFresh - Weekly Alerts</h2>')
     html.append(f'<p style="color:#666;margin-top:0;">{run_date.isoformat()}</p>')
 
     if marca_maxima:
         html.append(f'<div style="{css_box}background:#FFEBEE;border:2px solid #D32F2F;">')
-        html.append('<strong style="color:#D32F2F;font-size:15px;">⚠ URGENTE - Posicao de marca caindo</strong>')
+        html.append('<strong style="color:#D32F2F;font-size:15px;">⚠ URGENT - Brand position dropping</strong>')
         html.append('<ul style="margin:8px 0 0 0;padding-left:20px;">')
         for a in marca_maxima[:MAX_ITEMS_PER_SECTION]:
-            html.append(f'<li><b>{_html_escape(a["query"])}</b>: posicao '
+            html.append(f'<li><b>{_html_escape(a["query"])}</b>: position '
                         f'{a["posicao_media_4sem"]} → {a["posicao"]} '
                         f'<span style="color:#888;">({_html_escape(a["pagina"])})</span></li>')
         if len(marca_maxima) > MAX_ITEMS_PER_SECTION:
-            html.append(f'<li><i>+{len(marca_maxima)-MAX_ITEMS_PER_SECTION} outras na planilha</i></li>')
+            html.append(f'<li><i>+{len(marca_maxima)-MAX_ITEMS_PER_SECTION} more in the spreadsheet</i></li>')
         html.append('</ul></div>')
 
-    # resumo em grade
+    # summary grid
     html.append(f'<table style="{css_table}"><tr>')
     html.append('<td colspan="2" style="background:#1F3864;color:white;padding:8px 12px;'
-                'font-weight:bold;">Resumo</td></tr>')
+                'font-weight:bold;">Summary</td></tr>')
     for key, label, color in GATILHO_INFO:
         n = len(data[key])
         bg = color if n > 0 else "#F5F5F5"
@@ -1069,17 +1069,17 @@ def _build_html_email(data, run_date, total, marca_maxima, g8):
                f'<td style="padding:8px 12px;text-align:right;font-weight:bold;">{total}</td></tr>')
     html.append('</table>')
 
-    # secoes detalhadas (so as que tem alerta, so o topo)
+    # detailed sections (only the ones with alerts, top items only)
     section_renderers = {
         "g1": lambda a: f'<b>{_html_escape(a["query"])}</b> - CTR {a["ctr_semana"]} '
                         f'(pos {a["posicao"]}, {a["impressoes_semana"]:,} impr)',
-        "g2": lambda a: f'<b>{_html_escape(a["query"])}</b> - impressoes cairam {a["queda_pct"]}',
+        "g2": lambda a: f'<b>{_html_escape(a["query"])}</b> - impressions dropped {a["queda_pct"]}',
         "g3": lambda a: f'<b>{_html_escape(a["query"])}</b> - {a["impressoes_semana"]} impr '
                         f'({a.get("tipo","")})',
-        "g4": lambda a: f'<b>{_html_escape(a["pagina"])}</b> - clicks cairam {a["queda_pct"]}',
+        "g4": lambda a: f'<b>{_html_escape(a["pagina"])}</b> - clicks dropped {a["queda_pct"]}',
         "g5": lambda a: f'<b>{_html_escape(a["pagina"])}</b> - {a["motivo"]}',
         "g6": lambda a: f'<b>{_html_escape(a["pagina"])}</b> - {a["gatilho"].replace("6. ","")}',
-        "g7": lambda a: f'<b>{_html_escape(a["query"])}</b> - {a["gatilho"].replace("7. Marca - ","")}',
+        "g7": lambda a: f'<b>{_html_escape(a["query"])}</b> - {a["gatilho"].replace("7. Brand - ","")}',
     }
     for key, label, color in GATILHO_INFO:
         rows = data[key]
@@ -1091,23 +1091,23 @@ def _build_html_email(data, run_date, total, marca_maxima, g8):
         for a in rows[:MAX_ITEMS_PER_SECTION]:
             html.append(f'<li>{section_renderers[key](a)}</li>')
         if len(rows) > MAX_ITEMS_PER_SECTION:
-            html.append(f'<li><i>+{len(rows)-MAX_ITEMS_PER_SECTION} outras na planilha anexa</i></li>')
+            html.append(f'<li><i>+{len(rows)-MAX_ITEMS_PER_SECTION} more in the attached spreadsheet</i></li>')
         html.append('</ul></div>')
 
-    # G8 - CTA de blog: secao propria, sempre visivel (nao e anomalia, e lead)
+    # G8 - blog CTA: own section, always visible (not an anomaly, it's a lead signal)
     if g8:
         total_sessoes = sum(r["sessoes_semana"] for r in g8)
         quebrados = [r for r in g8 if r.get("alerta")]
         box_color = "#FFEBEE" if quebrados else "#E8F5E9"
         border = "2px solid #D32F2F" if quebrados else "1px solid #A5D6A7"
         html.append(f'<div style="{css_box}background:{box_color};border:{border};">')
-        html.append(f'<strong>CTA de blog (cta_banner) - {total_sessoes} sessoes essa semana</strong>')
+        html.append(f'<strong>Blog CTA (cta_banner) - {total_sessoes} sessions this week</strong>')
         html.append('<table style="width:100%;margin-top:10px;font-size:13px;'
                     'border-collapse:collapse;">')
         html.append('<tr style="border-bottom:1px solid #ccc;"><td style="padding:4px 8px;">'
-                    '<b>Post (campanha)</b></td><td style="padding:4px 8px;text-align:right;">'
-                    '<b>Essa semana</b></td><td style="padding:4px 8px;text-align:right;">'
-                    '<b>Anterior</b></td><td style="padding:4px 8px;"><b>Variacao</b></td></tr>')
+                    '<b>Post (campaign)</b></td><td style="padding:4px 8px;text-align:right;">'
+                    '<b>This week</b></td><td style="padding:4px 8px;text-align:right;">'
+                    '<b>Previous</b></td><td style="padding:4px 8px;"><b>Change</b></td></tr>')
         for r in g8[:MAX_ITEMS_PER_SECTION]:
             row_bg = "background:#FFCDD2;" if r.get("alerta") else ""
             html.append(f'<tr style="{row_bg}"><td style="padding:4px 8px;">'
@@ -1121,11 +1121,11 @@ def _build_html_email(data, run_date, total, marca_maxima, g8):
                            f'⚠ {_html_escape(r["alerta"])}</td></tr>')
         if len(g8) > MAX_ITEMS_PER_SECTION:
             html.append(f'<tr><td colspan="4" style="padding:4px 8px;font-style:italic;'
-                       f'color:#888;">+{len(g8)-MAX_ITEMS_PER_SECTION} outras na planilha</td></tr>')
+                       f'color:#888;">+{len(g8)-MAX_ITEMS_PER_SECTION} more in the spreadsheet</td></tr>')
         html.append('</table></div>')
 
-    html.append('<p style="color:#666;font-size:12px;">Detalhe completo, com evidencia e '
-               'motivo de cada alerta, na planilha anexa.</p>')
+    html.append('<p style="color:#666;font-size:12px;">Full detail, with evidence and '
+               'the reason for each alert, in the attached spreadsheet.</p>')
     html.append('</div>')
     return "\n".join(html)
 
@@ -1136,27 +1136,27 @@ def send_email(g1, g2, g3, g4, g5, g6, g7, g8, report_path, run_date):
 
     data = {"g1": g1, "g2": g2, "g3": g3, "g4": g4, "g5": g5, "g6": g6, "g7": g7}
     total = sum(len(v) for v in data.values())
-    marca_maxima = [a for a in g7 if a.get("urgencia") == "MAXIMA"]
+    marca_maxima = [a for a in g7 if a.get("urgencia") == "MAXIMUM"]
 
-    # fallback em texto puro, para clientes de email sem suporte a HTML
-    text_lines = [f"TurFresh - Alertas Semanais - {run_date.isoformat()}", "=" * 55, ""]
+    # plain-text fallback, for email clients without HTML support
+    text_lines = [f"TurFresh - Weekly Alerts - {run_date.isoformat()}", "=" * 55, ""]
     if marca_maxima:
-        text_lines.append("URGENTE - POSICAO DE MARCA CAINDO:")
+        text_lines.append("URGENT - BRAND POSITION DROPPING:")
         for a in marca_maxima[:MAX_ITEMS_PER_SECTION]:
             text_lines.append(f"  {a['query']}: {a['posicao_media_4sem']} -> {a['posicao']}")
         text_lines.append("")
-    text_lines.append(f"Total: {total} alertas")
+    text_lines.append(f"Total: {total} alerts")
     for key, label, _ in GATILHO_INFO:
         text_lines.append(f"  {label}: {len(data[key])}")
     if g8:
         total_sessoes = sum(r["sessoes_semana"] for r in g8)
-        text_lines.append(f"\nCTA de blog (cta_banner): {total_sessoes} sessoes essa semana, "
-                          f"{len(g8)} campanhas")
+        text_lines.append(f"\nBlog CTA (cta_banner): {total_sessoes} sessions this week, "
+                          f"{len(g8)} campaigns")
         for r in g8[:MAX_ITEMS_PER_SECTION]:
-            marca = " [ALERTA]" if r.get("alerta") else ""
+            marca = " [ALERT]" if r.get("alerta") else ""
             text_lines.append(f"  {r['campanha']}: {r['sessoes_semana']} "
                              f"({r['variacao']}){marca}")
-    text_lines.append("\nDetalhe completo na planilha anexa.")
+    text_lines.append("\nFull detail in the attached spreadsheet.")
     text = "\n".join(text_lines)
 
     html = _build_html_email(data, run_date, total, marca_maxima, g8)
@@ -1166,8 +1166,8 @@ def send_email(g1, g2, g3, g4, g5, g6, g7, g8, report_path, run_date):
         return
 
     msg = EmailMessage()
-    prefix = "[URGENTE] " if marca_maxima else ""
-    msg["Subject"] = f"{prefix}[TurFresh] {total} alertas - {run_date.isoformat()}"
+    prefix = "[URGENT] " if marca_maxima else ""
+    msg["Subject"] = f"{prefix}[TurFresh] {total} alerts - {run_date.isoformat()}"
     msg["From"] = GMAIL_USER
     msg["To"] = ALERT_EMAIL_TO
     msg.set_content(text)
@@ -1269,7 +1269,7 @@ def gatilho_8_cta_banner(current_cta, previous_cta):
         if prev > 0:
             var = f"{(sessoes-prev)/prev*100:+.0f}%"
         else:
-            var = "novo"
+            var = "new"
         rows.append({"campanha": campanha, "sessoes_semana": sessoes,
                     "sessoes_semana_anterior": prev, "variacao": var,
                     "alerta": ""})
@@ -1280,7 +1280,7 @@ def gatilho_8_cta_banner(current_cta, previous_cta):
         if prev >= 3 and campanha not in current_campaigns:
             rows.append({"campanha": campanha, "sessoes_semana": 0,
                         "sessoes_semana_anterior": prev, "variacao": "-100%",
-                        "alerta": "Tinha sessoes, foi a zero - checar se o CTA ainda existe no post"})
+                        "alerta": "Had sessions, dropped to zero - check if the CTA still exists on the post"})
 
     rows.sort(key=lambda x: -x["sessoes_semana"])
     return rows
