@@ -1020,112 +1020,128 @@ def _html_escape(s):
     return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
 
-def _build_html_email(data, run_date, total, marca_maxima, g8):
-    """
-    Estrutura visual: caixa vermelha de urgencia no topo (se houver), depois
-    um resumo em grade com contagem por gatilho, depois cada gatilho que tem
-    alerta vira uma secao com no maximo MAX_ITEMS_PER_SECTION linhas - o
-    resto fica so na planilha anexa, para o e-mail nao virar parede de texto.
+# What to do, per trigger type. Matched against the "gatilho" field so each
+# task arrives with a concrete next step, not just evidence - ready to
+# become a ClickUp task without Rafael having to write the action himself.
+ACTION_BY_TRIGGER = {
+    "1. CTR Gap": "Rewrite the title/meta description to better match search intent for this query.",
+    "2. Early Impression Drop": "Check the live SERP for this query - a new AI Overview or SERP feature may be reducing visibility. Position is stable, so this is not a ranking problem.",
+    "4. Optimized Post Decay": "Refresh this post's content and check which competitor pages now outrank it.",
+    "5. Content Life Signal (Negative)": "Check URL Inspection in GSC - likely an indexing issue.",
+    "6. City Page Falling": "Investigate this city page - check for technical issues or new competitor activity in this market.",
+    "7. Brand - POSITION DROPPING": "Manually check the SERP for this brand query - a competitor or negative content may be outranking the homepage.",
+    "7. Brand - Traffic Dropping": "Check the Knowledge Panel and Google Business Profile for the brand term - an AI Overview may be showing instead of the site.",
+}
 
-    G8 (CTA de blog) e diferente dos outros: nao e deteccao de anomalia, e
-    visibilidade direta de lead - Rafael quer ver toda semana quais posts
-    estao levando gente pro contato, nao so quando algo quebra. Por isso tem
-    secao propria, sempre visivel quando ha dado, em vez de entrar no loop
-    dos outros 7 (que so aparecem quando tem alerta).
-    """
-    css_box = ("border-radius:8px;padding:16px 20px;margin-bottom:16px;"
-               "font-family:Arial,Helvetica,sans-serif;")
-    css_table = ("width:100%;border-collapse:collapse;margin-bottom:20px;"
-                "font-family:Arial,Helvetica,sans-serif;font-size:13px;")
+# Trigger types that represent a problem needing a fix. Everything else
+# (new query opportunities, city pages rising, positive life signals) is
+# good news or upside - it stays in the spreadsheet for context, but does
+# not belong in a "things to fix" task list.
+URGENT_TRIGGER_TYPES = set(ACTION_BY_TRIGGER.keys())
 
-    html = [f'<div style="font-family:Arial,Helvetica,sans-serif;max-width:720px;">']
-    html.append(f'<h2 style="color:#1F3864;margin-bottom:4px;">TurFresh - Weekly Alerts</h2>')
+
+def build_urgent_tasks(g1, g2, g3, g4, g5, g6, g7, g8):
+    """
+    Filters the 8 triggers down to only what represents a real problem -
+    the subset Rafael turns into ClickUp tasks. Opportunity/good-news
+    signals (new queries, pages rising, positive life signals, and G8 rows
+    without a break) are left out of this list on purpose; they still live
+    in the full spreadsheet.
+    """
+    tasks = []
+
+    for alert in g1 + g2 + g4 + g5 + g6 + g7:
+        if alert.get("gatilho") not in URGENT_TRIGGER_TYPES:
+            continue
+        priority = "MAXIMUM" if alert.get("urgencia") == "MAXIMUM" else (
+            "HIGH" if alert.get("confianca") == "HIGH" or alert.get("urgencia") == "HIGH"
+            else "MEDIUM")
+        tasks.append({
+            "priority": priority,
+            "trigger": alert["gatilho"],
+            "target": alert.get("query") or alert.get("pagina", ""),
+            "page": alert.get("pagina", ""),
+            "evidence": alert.get("motivo", ""),
+            "action": ACTION_BY_TRIGGER.get(alert["gatilho"], "Review manually."),
+        })
+
+    for r in g8:
+        if not r.get("alerta"):
+            continue
+        tasks.append({
+            "priority": "HIGH",
+            "trigger": "8. Blog CTA",
+            "target": r["campanha"],
+            "page": "",
+            "evidence": r["alerta"],
+            "action": "Check if the CTA banner is still present on this post and that the link is not broken.",
+        })
+
+    order = {"MAXIMUM": 0, "HIGH": 1, "MEDIUM": 2}
+    tasks.sort(key=lambda t: order.get(t["priority"], 3))
+    for i, t in enumerate(tasks, 1):
+        t["num"] = i
+    return tasks
+
+
+PRIORITY_COLOR = {
+    "MAXIMUM": ("#FFEBEE", "#D32F2F"),
+    "HIGH": ("#FFF3E0", "#E65100"),
+    "MEDIUM": ("#FFFDE7", "#F9A825"),
+}
+
+
+def _build_html_email(tasks, run_date, opportunity_count):
+    """
+    Rafael's ask: the email should arrive Monday with only what is urgent
+    and needs to become a ClickUp task - not the full picture of all 8
+    triggers. Everything else (new-query opportunities, pages rising,
+    positive life signals) still lives in the attached spreadsheet, which
+    he sends alongside the Monday SE Ranking audit.
+
+    Each task carries a concrete next step (ACTION_BY_TRIGGER), so a task
+    can go straight into ClickUp without being rewritten.
+    """
+    html = ['<div style="font-family:Arial,Helvetica,sans-serif;max-width:720px;">']
+    html.append('<h2 style="color:#1F3864;margin-bottom:4px;">TurFresh - Weekly Tasks</h2>')
     html.append(f'<p style="color:#666;margin-top:0;">{run_date.isoformat()}</p>')
 
-    if marca_maxima:
-        html.append(f'<div style="{css_box}background:#FFEBEE;border:2px solid #D32F2F;">')
-        html.append('<strong style="color:#D32F2F;font-size:15px;">⚠ URGENT - Brand position dropping</strong>')
-        html.append('<ul style="margin:8px 0 0 0;padding-left:20px;">')
-        for a in marca_maxima[:MAX_ITEMS_PER_SECTION]:
-            html.append(f'<li><b>{_html_escape(a["query"])}</b>: position '
-                        f'{a["posicao_media_4sem"]} → {a["posicao"]} '
-                        f'<span style="color:#888;">({_html_escape(a["pagina"])})</span></li>')
-        if len(marca_maxima) > MAX_ITEMS_PER_SECTION:
-            html.append(f'<li><i>+{len(marca_maxima)-MAX_ITEMS_PER_SECTION} more in the spreadsheet</i></li>')
-        html.append('</ul></div>')
+    if not tasks:
+        html.append('<div style="border-radius:8px;padding:16px 20px;background:#E8F5E9;'
+                    'border:1px solid #A5D6A7;font-family:Arial,Helvetica,sans-serif;">')
+        html.append('<strong>No urgent tasks this week.</strong>')
+        if opportunity_count:
+            html.append(f'<p style="margin:8px 0 0 0;color:#555;">{opportunity_count} '
+                       f'opportunity/visibility items (new queries, pages rising) are in '
+                       f'the attached spreadsheet - no action needed, FYI only.</p>')
+        html.append('</div></div>')
+        return "\n".join(html)
 
-    # summary grid
-    html.append(f'<table style="{css_table}"><tr>')
-    html.append('<td colspan="2" style="background:#1F3864;color:white;padding:8px 12px;'
-                'font-weight:bold;">Summary</td></tr>')
-    for key, label, color in GATILHO_INFO:
-        n = len(data[key])
-        bg = color if n > 0 else "#F5F5F5"
-        html.append(f'<tr><td style="padding:6px 12px;border-bottom:1px solid #eee;'
-                    f'background:{bg};">{label}</td>'
-                    f'<td style="padding:6px 12px;border-bottom:1px solid #eee;'
-                    f'background:{bg};text-align:right;font-weight:bold;">{n}</td></tr>')
-    html.append(f'<tr><td style="padding:8px 12px;font-weight:bold;">Total</td>'
-               f'<td style="padding:8px 12px;text-align:right;font-weight:bold;">{total}</td></tr>')
-    html.append('</table>')
+    for t in tasks:
+        bg, border = PRIORITY_COLOR.get(t["priority"], PRIORITY_COLOR["MEDIUM"])
+        html.append(f'<div style="border-radius:8px;padding:14px 18px;margin-bottom:12px;'
+                    f'background:{bg};border-left:4px solid {border};'
+                    f'font-family:Arial,Helvetica,sans-serif;">')
+        html.append(f'<div style="font-size:11px;font-weight:bold;color:{border};'
+                    f'text-transform:uppercase;margin-bottom:4px;">'
+                    f'#{t["num"]} · {t["priority"]} · {_html_escape(t["trigger"])}</div>')
+        html.append(f'<div style="font-size:14px;font-weight:bold;margin-bottom:4px;">'
+                    f'{_html_escape(t["target"])}</div>')
+        if t["page"] and t["page"] != t["target"]:
+            html.append(f'<div style="font-size:12px;color:#666;margin-bottom:6px;">'
+                        f'{_html_escape(t["page"])}</div>')
+        html.append(f'<div style="font-size:13px;color:#333;margin-bottom:6px;">'
+                    f'<b>Action:</b> {_html_escape(t["action"])}</div>')
+        html.append(f'<div style="font-size:12px;color:#777;">'
+                    f'<b>Why:</b> {_html_escape(t["evidence"])}</div>')
+        html.append('</div>')
 
-    # detailed sections (only the ones with alerts, top items only)
-    section_renderers = {
-        "g1": lambda a: f'<b>{_html_escape(a["query"])}</b> - CTR {a["ctr_semana"]} '
-                        f'(pos {a["posicao"]}, {a["impressoes_semana"]:,} impr)',
-        "g2": lambda a: f'<b>{_html_escape(a["query"])}</b> - impressions dropped {a["queda_pct"]}',
-        "g3": lambda a: f'<b>{_html_escape(a["query"])}</b> - {a["impressoes_semana"]} impr '
-                        f'({a.get("tipo","")})',
-        "g4": lambda a: f'<b>{_html_escape(a["pagina"])}</b> - clicks dropped {a["queda_pct"]}',
-        "g5": lambda a: f'<b>{_html_escape(a["pagina"])}</b> - {a["motivo"]}',
-        "g6": lambda a: f'<b>{_html_escape(a["pagina"])}</b> - {a["gatilho"].replace("6. ","")}',
-        "g7": lambda a: f'<b>{_html_escape(a["query"])}</b> - {a["gatilho"].replace("7. Brand - ","")}',
-    }
-    for key, label, color in GATILHO_INFO:
-        rows = data[key]
-        if not rows:
-            continue
-        html.append(f'<div style="{css_box}background:{color};">')
-        html.append(f'<strong>{label} ({len(rows)})</strong>')
-        html.append('<ul style="margin:8px 0 0 0;padding-left:20px;">')
-        for a in rows[:MAX_ITEMS_PER_SECTION]:
-            html.append(f'<li>{section_renderers[key](a)}</li>')
-        if len(rows) > MAX_ITEMS_PER_SECTION:
-            html.append(f'<li><i>+{len(rows)-MAX_ITEMS_PER_SECTION} more in the attached spreadsheet</i></li>')
-        html.append('</ul></div>')
-
-    # G8 - blog CTA: own section, always visible (not an anomaly, it's a lead signal)
-    if g8:
-        total_sessoes = sum(r["sessoes_semana"] for r in g8)
-        quebrados = [r for r in g8 if r.get("alerta")]
-        box_color = "#FFEBEE" if quebrados else "#E8F5E9"
-        border = "2px solid #D32F2F" if quebrados else "1px solid #A5D6A7"
-        html.append(f'<div style="{css_box}background:{box_color};border:{border};">')
-        html.append(f'<strong>Blog CTA (cta_banner) - {total_sessoes} sessions this week</strong>')
-        html.append('<table style="width:100%;margin-top:10px;font-size:13px;'
-                    'border-collapse:collapse;">')
-        html.append('<tr style="border-bottom:1px solid #ccc;"><td style="padding:4px 8px;">'
-                    '<b>Post (campaign)</b></td><td style="padding:4px 8px;text-align:right;">'
-                    '<b>This week</b></td><td style="padding:4px 8px;text-align:right;">'
-                    '<b>Previous</b></td><td style="padding:4px 8px;"><b>Change</b></td></tr>')
-        for r in g8[:MAX_ITEMS_PER_SECTION]:
-            row_bg = "background:#FFCDD2;" if r.get("alerta") else ""
-            html.append(f'<tr style="{row_bg}"><td style="padding:4px 8px;">'
-                        f'{_html_escape(r["campanha"])}</td>'
-                        f'<td style="padding:4px 8px;text-align:right;">{r["sessoes_semana"]}</td>'
-                        f'<td style="padding:4px 8px;text-align:right;">{r["sessoes_semana_anterior"]}</td>'
-                        f'<td style="padding:4px 8px;">{r["variacao"]}</td></tr>')
-            if r.get("alerta"):
-                html.append(f'<tr style="background:#FFCDD2;"><td colspan="4" '
-                           f'style="padding:2px 8px 6px 8px;font-size:12px;color:#B71C1C;">'
-                           f'⚠ {_html_escape(r["alerta"])}</td></tr>')
-        if len(g8) > MAX_ITEMS_PER_SECTION:
-            html.append(f'<tr><td colspan="4" style="padding:4px 8px;font-style:italic;'
-                       f'color:#888;">+{len(g8)-MAX_ITEMS_PER_SECTION} more in the spreadsheet</td></tr>')
-        html.append('</table></div>')
-
-    html.append('<p style="color:#666;font-size:12px;">Full detail, with evidence and '
-               'the reason for each alert, in the attached spreadsheet.</p>')
+    if opportunity_count:
+        html.append(f'<p style="color:#666;font-size:12px;">Plus {opportunity_count} '
+                   f'opportunity/visibility items (new queries, pages rising, positive '
+                   f'signals) with no action needed - see the attached spreadsheet.</p>')
+    html.append('<p style="color:#666;font-size:12px;">Full detail and evidence for every '
+               'trigger, including the ones not listed above, in the attached spreadsheet.</p>')
     html.append('</div>')
     return "\n".join(html)
 
@@ -1134,40 +1150,48 @@ def send_email(g1, g2, g3, g4, g5, g6, g7, g8, report_path, run_date):
     import smtplib
     from email.message import EmailMessage
 
-    data = {"g1": g1, "g2": g2, "g3": g3, "g4": g4, "g5": g5, "g6": g6, "g7": g7}
-    total = sum(len(v) for v in data.values())
-    marca_maxima = [a for a in g7 if a.get("urgencia") == "MAXIMUM"]
+    tasks = build_urgent_tasks(g1, g2, g3, g4, g5, g6, g7, g8)
+
+    # everything that did NOT become a task: opportunities and good news,
+    # kept out of the email on purpose, still counted so Rafael knows the
+    # spreadsheet has more context even when the email is short.
+    total_all = len(g1) + len(g2) + len(g3) + len(g4) + len(g5) + len(g6) + len(g7) + len(g8)
+    opportunity_count = total_all - len(tasks)
+
+    maximum_tasks = [t for t in tasks if t["priority"] == "MAXIMUM"]
 
     # plain-text fallback, for email clients without HTML support
-    text_lines = [f"TurFresh - Weekly Alerts - {run_date.isoformat()}", "=" * 55, ""]
-    if marca_maxima:
-        text_lines.append("URGENT - BRAND POSITION DROPPING:")
-        for a in marca_maxima[:MAX_ITEMS_PER_SECTION]:
-            text_lines.append(f"  {a['query']}: {a['posicao_media_4sem']} -> {a['posicao']}")
-        text_lines.append("")
-    text_lines.append(f"Total: {total} alerts")
-    for key, label, _ in GATILHO_INFO:
-        text_lines.append(f"  {label}: {len(data[key])}")
-    if g8:
-        total_sessoes = sum(r["sessoes_semana"] for r in g8)
-        text_lines.append(f"\nBlog CTA (cta_banner): {total_sessoes} sessions this week, "
-                          f"{len(g8)} campaigns")
-        for r in g8[:MAX_ITEMS_PER_SECTION]:
-            marca = " [ALERT]" if r.get("alerta") else ""
-            text_lines.append(f"  {r['campanha']}: {r['sessoes_semana']} "
-                             f"({r['variacao']}){marca}")
-    text_lines.append("\nFull detail in the attached spreadsheet.")
+    text_lines = [f"TurFresh - Weekly Tasks - {run_date.isoformat()}", "=" * 55, ""]
+    if not tasks:
+        text_lines.append("No urgent tasks this week.")
+        if opportunity_count:
+            text_lines.append(f"{opportunity_count} opportunity/visibility items (no action "
+                             f"needed) are in the attached spreadsheet.")
+    else:
+        for t in tasks:
+            text_lines.append(f"#{t['num']} [{t['priority']}] {t['trigger']}")
+            text_lines.append(f"    {t['target']}")
+            if t["page"] and t["page"] != t["target"]:
+                text_lines.append(f"    {t['page']}")
+            text_lines.append(f"    Action: {t['action']}")
+            text_lines.append(f"    Why: {t['evidence']}")
+            text_lines.append("")
+        if opportunity_count:
+            text_lines.append(f"Plus {opportunity_count} opportunity/visibility items "
+                             f"(no action needed) in the attached spreadsheet.")
+    text_lines.append("\nFull detail for every trigger in the attached spreadsheet.")
     text = "\n".join(text_lines)
 
-    html = _build_html_email(data, run_date, total, marca_maxima, g8)
+    html = _build_html_email(tasks, run_date, opportunity_count)
 
     if not (GMAIL_USER and GMAIL_APP_PASSWORD and ALERT_EMAIL_TO):
         print(text)
         return
 
     msg = EmailMessage()
-    prefix = "[URGENT] " if marca_maxima else ""
-    msg["Subject"] = f"{prefix}[TurFresh] {total} alerts - {run_date.isoformat()}"
+    prefix = "[URGENT] " if maximum_tasks else ""
+    task_word = "task" if len(tasks) == 1 else "tasks"
+    msg["Subject"] = f"{prefix}[TurFresh] {len(tasks)} {task_word} - {run_date.isoformat()}"
     msg["From"] = GMAIL_USER
     msg["To"] = ALERT_EMAIL_TO
     msg.set_content(text)
