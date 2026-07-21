@@ -448,14 +448,33 @@ def gatilho_1_vazamento_ctr(current_df, trailing_stats, seo_log_urls=None):
 
         confianca = "HIGH" if (st and st["confiavel"]) else "LOW (limited history)"
 
+        # --- Zero estrutural: CTR literalmente 0% (nao so "abaixo de 1%") numa
+        # posicao boa (top 8) com volume real. Isso e um padrao diferente de
+        # "titulo fraco" - e a assinatura classica de uma citacao de AI
+        # Overview ou outro recurso que mostra a pagina como fonte sem gerar
+        # clique nenhum. Nao ha correcao de copy para isso, entao nao deve
+        # competir por atencao como se fosse um problema resolvivel.
+        is_structural_zero = ctr < 0.001
+
         # --- enriquecimento com dado real da pagina, quando disponivel ---
         seo_log_hyp = None
         seo_log_verify = None
         seo_log_action = None
+        actionable = True   # vira tarefa por padrao; alguns casos abaixo desligam isso
         page_path = norm_path(page)
         meta = seo_log_urls.get(page_path)
 
-        if meta:
+        if is_structural_zero:
+            seo_log_hyp = (f"CTR is literally 0% at position {pos:.1f} with real volume "
+                           f"({int(impr)} impressions) - not just low. This is the typical "
+                           f"signature of an AI Overview or other feature citing this page as "
+                           f"a source without sending a click, not a weak title.")
+            seo_log_verify = (f"Search this exact query and check whether an AI Overview or "
+                              f"other feature is citing this page instead of showing it as a "
+                              f"normal clickable result.")
+            seo_log_action = "No copy fix applies here. If confirmed as an AI Overview citation, this is worth knowing but not worth a task - track it, don't act on it."
+            actionable = False
+        elif meta:
             known_issue = extract_known_issue(meta.get("feito", ""))
             overlap = keyword_overlap_ratio(query, meta.get("keyword", ""), meta.get("meta_title", ""))
 
@@ -471,7 +490,8 @@ def gatilho_1_vazamento_ctr(current_df, trailing_stats, seo_log_urls=None):
                 seo_log_verify = ("Check the live SERP for a map pack, People Also Ask, or AI "
                                   "Overview above position " + f"{pos:.0f} - that is the more "
                                   "likely cause given the title already matches.")
-                seo_log_action = "Do not rewrite the title/meta. Track the SERP feature instead - there is usually no direct fix."
+                seo_log_action = "No title/meta change to make here. If a SERP feature is confirmed, there is usually no direct fix - not worth a task."
+                actionable = False
             else:
                 seo_log_hyp = (f"This page is logged as targeting \"{meta.get('keyword','')}\" "
                                f"(meta title: \"{meta.get('meta_title','')}\"), which does not "
@@ -493,6 +513,7 @@ def gatilho_1_vazamento_ctr(current_df, trailing_stats, seo_log_urls=None):
                                if st and st["media_impr"] > 0 else "no history"),
             "motivo": motivo,
             "confianca": confianca,
+            "actionable": actionable,
         }
         if seo_log_hyp:
             alert["hypothesis_override"] = seo_log_hyp
@@ -1211,6 +1232,8 @@ def build_urgent_tasks(g1, g2, g3, g4, g5, g6, g7, g8):
         trigger = alert.get("gatilho")
         if trigger not in URGENT_TRIGGER_TYPES:
             continue
+        if alert.get("actionable") is False:
+            continue   # diagnosis already concluded there's no real fix - not a task
         priority = "MAXIMUM" if alert.get("urgencia") == "MAXIMUM" else (
             "HIGH" if alert.get("confianca") == "HIGH" or alert.get("urgencia") == "HIGH"
             else "MEDIUM")
