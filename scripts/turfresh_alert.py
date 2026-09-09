@@ -1303,6 +1303,19 @@ ALERT_EMAIL_TO = os.environ.get("ALERT_EMAIL_TO")
 GA4_PROPERTY_ID = os.environ.get("GA4_PROPERTY_ID", "")
 CTA_UTM_MEDIUM = "cta_banner"
 
+# --- Lead Source Report (SEO) ---
+# Reusa a mesma conta de servico/propriedade GA4 do Gatilho 8 (nenhum
+# secret novo). Roda dentro do mesmo main(), gera uma planilha e um e-mail
+# SEPARADOS do alerta semanal, porque responde uma pergunta diferente: nao
+# "algo mudou", mas "o que esta de fato gerando lead".
+LEAD_EVENT_NAMES = ["form_submit", "ga4_location_page_form_submission"]
+# form_submit: evento automatico do GA4 (Enhanced Measurement), site inteiro.
+# ga4_location_page_form_submission: evento customizado, so das city pages.
+# ga4_contact_us_page_form_submission existe como key event configurado mas
+# aparecia "No stream data detected" quando checamos - nao esta disparando
+# de verdade hoje. Vale investigar a parte por que o formulario da pagina
+# /contact/ principal nao esta sendo rastreado.
+
 MAX_ITEMS_PER_SECTION = 8   # o e-mail mostra o topo; a planilha tem a lista inteira
 
 GATILHO_INFO = [
@@ -1746,6 +1759,263 @@ def gatilho_8_cta_banner(current_cta, previous_cta):
 
 
 # ===========================================================================
+# LEAD SOURCE REPORT (SEO)
+# Nao existia antes. Diferente dos 9 gatilhos (que avisam "algo mudou"),
+# este relatorio responde "o que esta de fato gerando lead" - roda toda
+# segunda junto com o resto, mas gera planilha e e-mail SEPARADOS, porque
+# e uma pergunta diferente, nao mais um alerta de anomalia.
+#
+# Eventos usados (confirmados ativos em GA4 > Admin > Data display > Events):
+#   form_submit: evento automatico do GA4 (Enhanced Measurement), site
+#     inteiro, sem diferenciar qual formulario, mas com contexto de pagina.
+#   ga4_location_page_form_submission: evento customizado, so das city pages.
+# Nota: ga4_contact_us_page_form_submission existe como key event configurado
+# mas aparecia "No stream data detected" quando checamos - nao esta
+# disparando de verdade hoje. Vale investigar por que o formulario da pagina
+# /contact/ principal nao esta sendo rastreado, separado deste relatorio.
+#
+# Reusa get_ga4_client() do Gatilho 8 acima - mesma conta de servico, mesma
+# propriedade, nenhum secret novo.
+# ===========================================================================
+def fetch_organic_leads_by_page(client, start_date, end_date):
+    """
+    Secao A: quais landing pages organicas geraram lead. Filtro combinado
+    (AND): sessionDefaultChannelGroup = 'Organic Search' E eventName em
+    LEAD_EVENT_NAMES. Agrupado por landing page + nome do evento, porque
+    ga4_location_page_form_submission (so cidade) e form_submit (site
+    inteiro) contam coisas um pouco diferentes - misturar sem separar
+    esconderia isso. Usa landingPage (sem query string) para nao fragmentar
+    a mesma pagina em varias linhas por causa de UTM diferentes.
+    """
+    if client is None:
+        return pd.DataFrame()
+    try:
+        from google.analytics.data_v1beta.types import (
+            DateRange, Dimension, Metric, RunReportRequest, Filter,
+            FilterExpression, FilterExpressionList)
+        event_filter = FilterExpression(
+            filter=Filter(field_name="eventName",
+                         in_list_filter=Filter.InListFilter(values=LEAD_EVENT_NAMES)))
+        channel_filter = FilterExpression(
+            filter=Filter(field_name="sessionDefaultChannelGroup",
+                         string_filter=Filter.StringFilter(value="Organic Search")))
+        combined = FilterExpression(
+            and_group=FilterExpressionList(expressions=[event_filter, channel_filter]))
+
+        request = RunReportRequest(
+            property=f"properties/{GA4_PROPERTY_ID}",
+            date_ranges=[DateRange(start_date=start_date.isoformat(),
+                                   end_date=end_date.isoformat())],
+            dimensions=[Dimension(name="landingPage"), Dimension(name="eventName")],
+            metrics=[Metric(name="eventCount")],
+            dimension_filter=combined,
+            limit=100000,
+        )
+        resp = client.run_report(request)
+        rows = []
+        for r in resp.rows:
+            rows.append({
+                "pagina": r.dimension_values[0].value,
+                "evento": r.dimension_values[1].value,
+                "leads": int(r.metric_values[0].value),
+            })
+        return pd.DataFrame(rows)
+    except Exception as e:
+        print(f"  Erro ao buscar leads organicos por pagina: {e}")
+        return pd.DataFrame()
+
+
+def fetch_cta_banner_leads(client, start_date, end_date):
+    """
+    Secao B: quais posts do blog, via banner de CTA (utm_medium=cta_banner),
+    geraram lead de verdade - complementa o Gatilho 8, que so mostra
+    sessao/clique, nao conversao. Mesmo filtro combinado, trocando o canal
+    por sessionMedium = cta_banner.
+    """
+    if client is None:
+        return pd.DataFrame()
+    try:
+        from google.analytics.data_v1beta.types import (
+            DateRange, Dimension, Metric, RunReportRequest, Filter,
+            FilterExpression, FilterExpressionList)
+        event_filter = FilterExpression(
+            filter=Filter(field_name="eventName",
+                         in_list_filter=Filter.InListFilter(values=LEAD_EVENT_NAMES)))
+        medium_filter = FilterExpression(
+            filter=Filter(field_name="sessionMedium",
+                         string_filter=Filter.StringFilter(value=CTA_UTM_MEDIUM)))
+        combined = FilterExpression(
+            and_group=FilterExpressionList(expressions=[event_filter, medium_filter]))
+
+        request = RunReportRequest(
+            property=f"properties/{GA4_PROPERTY_ID}",
+            date_ranges=[DateRange(start_date=start_date.isoformat(),
+                                   end_date=end_date.isoformat())],
+            dimensions=[Dimension(name="sessionCampaignName"), Dimension(name="eventName")],
+            metrics=[Metric(name="eventCount")],
+            dimension_filter=combined,
+            limit=100000,
+        )
+        resp = client.run_report(request)
+        rows = []
+        for r in resp.rows:
+            rows.append({
+                "campanha_post": r.dimension_values[0].value,
+                "evento": r.dimension_values[1].value,
+                "leads": int(r.metric_values[0].value),
+            })
+        return pd.DataFrame(rows)
+    except Exception as e:
+        print(f"  Erro ao buscar leads de CTA banner: {e}")
+        return pd.DataFrame()
+
+
+def _lead_variation(current, previous):
+    if previous > 0:
+        return f"{(current - previous) / previous * 100:+.0f}%"
+    return "new" if current > 0 else "-"
+
+
+def _lead_source_sheet(wb, title, df_now, df_prev, group_col, label):
+    """
+    Sheet dedicado do Lead Source, separado de _sheet() (que e feito para
+    as cores/colunas dos 9 gatilhos). Mesma formatacao visual (HEADER azul
+    ja definido acima), mas colunas proprias: pagina/campanha, evento,
+    leads da semana, leads da semana anterior, variacao.
+    """
+    ws = wb.create_sheet(title)
+    cols = [("label", label, 45), ("evento", "Event", 34),
+            ("leads_semana", "Leads this week", 15),
+            ("leads_semana_anterior", "Leads prev week", 15),
+            ("variacao", "Change", 10)]
+    for i, (key, h, w) in enumerate(cols, 1):
+        c = ws.cell(1, i, h)
+        c.font = Font(bold=True, color="FFFFFF", size=10)
+        c.fill = HEADER
+        c.alignment = Alignment(vertical="center", horizontal="center", wrap_text=True)
+        ws.column_dimensions[get_column_letter(i)].width = w
+    ws.row_dimensions[1].height = 22
+
+    rows = []
+    if not df_now.empty:
+        prev_map = {}
+        if not df_prev.empty:
+            for _, r in df_prev.iterrows():
+                prev_map[(r[group_col], r["evento"])] = r["leads"]
+        for _, r in df_now.iterrows():
+            prev = prev_map.get((r[group_col], r["evento"]), 0)
+            rows.append({
+                "label": r[group_col], "evento": r["evento"],
+                "leads_semana": int(r["leads"]), "leads_semana_anterior": int(prev),
+                "variacao": _lead_variation(int(r["leads"]), int(prev)),
+            })
+        rows.sort(key=lambda x: -x["leads_semana"])
+
+    for ri, row in enumerate(rows, 2):
+        for ci, (key, _, _) in enumerate(cols, 1):
+            cell = ws.cell(ri, ci, row.get(key, ""))
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+    ws.freeze_panes = "A2"
+    if rows:
+        ws.auto_filter.ref = f"A1:{get_column_letter(len(cols))}{len(rows)+1}"
+    return rows
+
+
+def build_lead_source_report(organic_now, organic_prev, cta_now, cta_prev, run_date,
+                              path="turfresh_lead_source.xlsx"):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Summary"
+    ws["A1"] = f"TurFresh - Lead Source (SEO) - {run_date.isoformat()}"
+    ws["A1"].font = Font(bold=True, size=14)
+    total_organic = int(organic_now["leads"].sum()) if not organic_now.empty else 0
+    total_cta = int(cta_now["leads"].sum()) if not cta_now.empty else 0
+    ws["A3"] = f"Leads via Organic Search (all landing pages): {total_organic}"
+    ws["A4"] = f"Leads via Blog CTA banner: {total_cta}"
+    ws.column_dimensions["A"].width = 55
+
+    organic_rows = _lead_source_sheet(wb, "Organic Search", organic_now, organic_prev,
+                                      "pagina", "Landing page")
+    cta_rows = _lead_source_sheet(wb, "CTA Banner", cta_now, cta_prev,
+                                  "campanha_post", "Blog post (campaign)")
+
+    wb.save(path)
+    return path, organic_rows, cta_rows
+
+
+def send_lead_source_email(organic_rows, cta_rows, report_path, run_date):
+    import smtplib
+    from email.message import EmailMessage
+
+    top_organic = organic_rows[:MAX_ITEMS_PER_SECTION]
+    top_cta = cta_rows[:MAX_ITEMS_PER_SECTION]
+
+    html = ['<div style="font-family:Arial,Helvetica,sans-serif;max-width:720px;">']
+    html.append('<h2 style="color:#1F3864;margin-bottom:4px;">TurFresh - Lead Source (SEO)</h2>')
+    html.append(f'<p style="color:#666;margin-top:0;">{run_date.isoformat()}</p>')
+
+    html.append('<h3 style="color:#1F3864;margin-bottom:6px;">Organic Search - top landing pages</h3>')
+    if not top_organic:
+        html.append('<p style="color:#555;">No organic leads this week.</p>')
+    else:
+        html.append('<ul style="padding-left:18px;margin-top:4px;">')
+        for r in top_organic:
+            html.append(f'<li><b>{r["leads_semana"]}</b> lead(s) ({r["variacao"]} vs last week) '
+                       f'- {_html_escape(r["label"])} '
+                       f'<span style="color:#888;">[{_html_escape(r["evento"])}]</span></li>')
+        html.append('</ul>')
+
+    html.append('<h3 style="color:#1F3864;margin-bottom:6px;">Blog CTA banner - top posts</h3>')
+    if not top_cta:
+        html.append('<p style="color:#555;">No CTA banner leads this week.</p>')
+    else:
+        html.append('<ul style="padding-left:18px;margin-top:4px;">')
+        for r in top_cta:
+            html.append(f'<li><b>{r["leads_semana"]}</b> lead(s) ({r["variacao"]} vs last week) '
+                       f'- {_html_escape(r["label"])} '
+                       f'<span style="color:#888;">[{_html_escape(r["evento"])}]</span></li>')
+        html.append('</ul>')
+
+    html.append('<p style="color:#666;font-size:12px;">Full breakdown, including week-over-week '
+               'change for every page and post, in the attached spreadsheet.</p>')
+    html.append('</div>')
+    html_str = "\n".join(html)
+
+    text_lines = [f"TurFresh - Lead Source (SEO) - {run_date.isoformat()}", "", "Top organic landing pages:"]
+    if not top_organic:
+        text_lines.append("  No organic leads this week.")
+    for r in top_organic:
+        text_lines.append(f"  {r['leads_semana']} ({r['variacao']}) - {r['label']} [{r['evento']}]")
+    text_lines.append("")
+    text_lines.append("Top CTA banner posts:")
+    if not top_cta:
+        text_lines.append("  No CTA banner leads this week.")
+    for r in top_cta:
+        text_lines.append(f"  {r['leads_semana']} ({r['variacao']}) - {r['label']} [{r['evento']}]")
+    text = "\n".join(text_lines)
+
+    if not (GMAIL_USER and GMAIL_APP_PASSWORD and ALERT_EMAIL_TO):
+        print(text)
+        return
+
+    msg = EmailMessage()
+    msg["Subject"] = f"[TurFresh] Lead Source (SEO) - {run_date.isoformat()}"
+    msg["From"] = GMAIL_USER
+    msg["To"] = ALERT_EMAIL_TO
+    msg.set_content(text)
+    msg.add_alternative(html_str, subtype="html")
+    with open(report_path, "rb") as f:
+        msg.add_attachment(f.read(), maintype="application",
+                           subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           filename=f"turfresh-lead-source-{run_date.isoformat()}.xlsx")
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
+        s.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+        s.send_message(msg)
+    print("Email enviado (Lead Source).")
+    print(text)
+
+
+# ===========================================================================
 # MAIN
 
 # ===========================================================================
@@ -1807,6 +2077,17 @@ def main():
     print(f"Relatorio: {report_path}\n")
 
     send_email(g1, g2, g3, g4, g5, g6, g7, g8, g9, systemic, report_path, run_date)
+
+    print("Gerando relatorio de Lead Source (SEO)...")
+    organic_now = fetch_organic_leads_by_page(ga4_client, cur_start, cur_end)
+    organic_prev = fetch_organic_leads_by_page(ga4_client, prev_start, prev_end)
+    cta_leads_now = fetch_cta_banner_leads(ga4_client, cur_start, cur_end)
+    cta_leads_prev = fetch_cta_banner_leads(ga4_client, prev_start, prev_end)
+    lead_report_path, organic_rows, cta_lead_rows = build_lead_source_report(
+        organic_now, organic_prev, cta_leads_now, cta_leads_prev, run_date)
+    print(f"  Relatorio: {lead_report_path}\n")
+
+    send_lead_source_email(organic_rows, cta_lead_rows, lead_report_path, run_date)
 
 
 if __name__ == "__main__":
