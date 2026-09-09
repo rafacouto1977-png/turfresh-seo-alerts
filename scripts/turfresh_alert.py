@@ -1332,9 +1332,15 @@ CTA_UTM_MEDIUM = "cta_banner"
 # secret novo). Roda dentro do mesmo main(), gera uma planilha e um e-mail
 # SEPARADOS do alerta semanal, porque responde uma pergunta diferente: nao
 # "algo mudou", mas "o que esta de fato gerando lead".
-LEAD_EVENT_NAMES = ["form_submit", "ga4_location_page_form_submission"]
+LEAD_EVENT_NAMES = ["form_submit", "ga4_location_page_form_submission",
+                    "ga4_phone_call", "ga4_sms_click"]
 # form_submit: evento automatico do GA4 (Enhanced Measurement), site inteiro.
 # ga4_location_page_form_submission: evento customizado, so das city pages.
+# ga4_phone_call / ga4_sms_click: clique no botao de telefone/SMS - e um
+# clique de INTENCAO, nao confirma que a ligacao ou SMS realmente aconteceu
+# (o GA4 nao tem como saber isso). Contado aqui do mesmo jeito que o
+# formulario porque ambos representam a mesma coisa do ponto de vista de
+# SEO: alguem que chegou organico decidiu tentar contato.
 # ga4_contact_us_page_form_submission existe como key event configurado mas
 # aparecia "No stream data detected" quando checamos - nao esta disparando
 # de verdade hoje. Vale investigar a parte por que o formulario da pagina
