@@ -304,13 +304,37 @@ def fetch_week(service, start_date, end_date):
     return filter_garbage_queries(pd.DataFrame(rows_out))
 
 
+def _most_recent_complete_week_end(today, lag_days):
+    """
+    Devolve o domingo mais recente que esta pelo menos `lag_days` dias no
+    passado, para a semana retornada ser sempre uma semana FECHADA (segunda
+    a domingo) com dado maduro no GSC - independente de em que dia da
+    semana o workflow de fato rodar (cron de segunda, de quarta, disparo
+    manual, etc).
+
+    Sem isso, a formula antiga (today - lag_days, depois 7 dias para tras)
+    so caia numa semana limpa por coincidencia quando 'today' era quarta-
+    feira. Rodando numa segunda-feira, por exemplo, ela devolvia um
+    intervalo sabado-a-sexta que nao bate com nenhuma semana de calendario.
+
+    Importante: se o workflow rodar numa segunda-feira, o domingo da semana
+    que acabou de terminar ainda NAO esta maduro no GSC (so 1 dia se
+    passou, contra o lag_days minimo exigido) - entao o resultado sera a
+    semana ANTERIOR a essa, nao a que acabou de fechar. Isso e uma
+    limitacao real do GSC, nao um bug desta funcao.
+    """
+    candidate = today - timedelta(days=lag_days)
+    days_since_sunday = (candidate.weekday() + 1) % 7   # Monday=0..Sunday=6
+    return candidate - timedelta(days=days_since_sunday)
+
+
 def fetch_trailing_weeks(service, n_weeks=N_TRAILING_WEEKS):
     """
     Retorna (semana_atual_df, [lista de N dataframes das semanas anteriores,
     mais antiga primeiro], janelas usadas).
     """
     today = date.today()
-    cur_end = today - timedelta(days=WEEK_LAG_DAYS)
+    cur_end = _most_recent_complete_week_end(today, WEEK_LAG_DAYS)
     cur_start = cur_end - timedelta(days=6)
 
     print(f"Semana atual: {cur_start} a {cur_end}")
