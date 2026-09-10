@@ -1416,6 +1416,19 @@ GUIDANCE_BY_TRIGGER = {
 
 URGENT_TRIGGER_TYPES = set(GUIDANCE_BY_TRIGGER.keys())
 
+# Pedido do Rafael: e-mail semanal so escala o que for GRAVE (padrao
+# sistemico, que ja e incondicional em build_urgent_tasks, ou risco de
+# marca). Os gatilhos de rotina (CTR Gap, Early Impression Drop, Optimized
+# Post Decay, Content Life Signal Negative, City Page Falling,
+# Cannibalization) continuam rodando toda semana e continuam indo para a
+# planilha completa (write_report nao usa este filtro) - so pararam de
+# virar "tarefa" no e-mail. O conteudo principal do e-mail agora e o
+# relatorio de GA4 (trafego + leads), nao mais o volume de alertas do GSC.
+SEVERE_TRIGGER_TYPES = {
+    "7. Brand - POSITION DROPPING",
+    "7. Brand - Traffic Dropping",
+}
+
 
 def _task_impact(alert):
     """
@@ -1482,7 +1495,7 @@ def build_urgent_tasks(g1, g2, g3, g4, g5, g6, g7, g8, g9=None, systemic=None):
 
     for alert in g1 + g2 + g4 + g5 + g6 + g7 + g9:
         trigger = alert.get("gatilho")
-        if trigger not in URGENT_TRIGGER_TYPES:
+        if trigger not in SEVERE_TRIGGER_TYPES:
             continue
         if alert.get("actionable") is False:
             continue   # diagnosis already concluded there's no real fix - not a task
@@ -1583,8 +1596,9 @@ def _build_html_email(tasks, run_date, opportunity_count):
         html.append('<strong>No urgent tasks this week.</strong>')
         if opportunity_count:
             html.append(f'<p style="margin:8px 0 0 0;color:#555;">{opportunity_count} '
-                       f'opportunity/visibility items (new queries, pages rising) are in '
-                       f'the attached spreadsheet - no action needed, FYI only.</p>')
+                       f'other findings (routine GSC triggers plus new-query opportunities) '
+                       f'are in the attached spreadsheet - not urgent enough for this email, '
+                       f'still worth a look.</p>')
         html.append('</div></div>')
         return "\n".join(html)
 
@@ -1613,8 +1627,9 @@ def _build_html_email(tasks, run_date, opportunity_count):
 
     if opportunity_count:
         html.append(f'<p style="color:#666;font-size:12px;">Plus {opportunity_count} '
-                   f'opportunity/visibility items (new queries, pages rising, positive '
-                   f'signals) with no action needed - see the attached spreadsheet.</p>')
+                   f'other findings (routine GSC triggers plus new-query opportunities, '
+                   f'positive signals) not urgent enough for this email - see the attached '
+                   f'spreadsheet.</p>')
     html.append('<p style="color:#666;font-size:12px;">Full detail and evidence for every '
                'trigger, including the ones not listed above, in the attached spreadsheet.</p>')
     html.append('</div>')
@@ -1641,8 +1656,8 @@ def send_email(g1, g2, g3, g4, g5, g6, g7, g8, g9, systemic, report_path, run_da
     if not tasks:
         text_lines.append("No urgent tasks this week.")
         if opportunity_count:
-            text_lines.append(f"{opportunity_count} opportunity/visibility items (no action "
-                             f"needed) are in the attached spreadsheet.")
+            text_lines.append(f"{opportunity_count} other findings (routine GSC triggers plus "
+                             f"opportunities) are in the attached spreadsheet.")
     else:
         for t in tasks:
             text_lines.append(f"#{t['num']} [{t['priority']}] {t['trigger']}")
@@ -1655,8 +1670,8 @@ def send_email(g1, g2, g3, g4, g5, g6, g7, g8, g9, systemic, report_path, run_da
             text_lines.append(f"    Then: {t['action']}")
             text_lines.append("")
         if opportunity_count:
-            text_lines.append(f"Plus {opportunity_count} opportunity/visibility items "
-                             f"(no action needed) in the attached spreadsheet.")
+            text_lines.append(f"Plus {opportunity_count} other findings (routine GSC triggers "
+                             f"plus opportunities) in the attached spreadsheet.")
     text_lines.append("\nFull detail for every trigger in the attached spreadsheet.")
     text = "\n".join(text_lines)
 
@@ -1900,18 +1915,166 @@ def fetch_cta_banner_leads(client, start_date, end_date):
         return pd.DataFrame()
 
 
-def _lead_variation(current, previous):
+def _variation(current, previous):
     if previous > 0:
         return f"{(current - previous) / previous * 100:+.0f}%"
     return "new" if current > 0 else "-"
 
 
+def fetch_organic_traffic_summary(client, start_date, end_date):
+    """
+    Secao C: pulso geral do trafego organico da semana - sessoes, usuarios,
+    sessoes engajadas, taxa de engajamento, duracao media de sessao. Sem
+    dimensao nenhuma (agrega tudo em uma linha so), filtrado por
+    sessionDefaultChannelGroup = 'Organic Search'. Isso e o "total, trafego"
+    que Rafael pediu - o resumo antes de entrar em detalhe por
+    pagina/dispositivo/regiao.
+    """
+    if client is None:
+        return {}
+    from google.analytics.data_v1beta.types import (
+        DateRange, Metric, RunReportRequest, Filter, FilterExpression)
+    try:
+        request = RunReportRequest(
+            property=f"properties/{GA4_PROPERTY_ID}",
+            date_ranges=[DateRange(start_date=start_date.isoformat(),
+                                   end_date=end_date.isoformat())],
+            metrics=[Metric(name="sessions"), Metric(name="totalUsers"),
+                    Metric(name="engagedSessions"), Metric(name="engagementRate"),
+                    Metric(name="averageSessionDuration")],
+            dimension_filter=FilterExpression(
+                filter=Filter(field_name="sessionDefaultChannelGroup",
+                             string_filter=Filter.StringFilter(value="Organic Search"))),
+        )
+        resp = client.run_report(request)
+        if not resp.rows:
+            return {}
+        r = resp.rows[0]
+        return {
+            "sessions": int(float(r.metric_values[0].value)),
+            "users": int(float(r.metric_values[1].value)),
+            "engaged_sessions": int(float(r.metric_values[2].value)),
+            "engagement_rate": float(r.metric_values[3].value),
+            "avg_duration_sec": float(r.metric_values[4].value),
+        }
+    except Exception as e:
+        print(f"  Erro ao buscar resumo de trafego organico: {e}")
+        return {}
+
+
+def fetch_organic_landing_pages(client, start_date, end_date):
+    """
+    Secao D: performance por landing page organica - sessoes, engajamento,
+    duracao media. Nao inclui lead aqui de proposito: lead ja tem secao
+    propria (fetch_organic_leads_by_page) - separar evita contar a mesma
+    coisa duas vezes de jeitos diferentes.
+    """
+    if client is None:
+        return pd.DataFrame()
+    from google.analytics.data_v1beta.types import (
+        DateRange, Dimension, Metric, RunReportRequest, Filter, FilterExpression)
+    try:
+        request = RunReportRequest(
+            property=f"properties/{GA4_PROPERTY_ID}",
+            date_ranges=[DateRange(start_date=start_date.isoformat(),
+                                   end_date=end_date.isoformat())],
+            dimensions=[Dimension(name="landingPage")],
+            metrics=[Metric(name="sessions"), Metric(name="engagedSessions"),
+                    Metric(name="engagementRate"), Metric(name="averageSessionDuration")],
+            dimension_filter=FilterExpression(
+                filter=Filter(field_name="sessionDefaultChannelGroup",
+                             string_filter=Filter.StringFilter(value="Organic Search"))),
+            limit=100000,
+        )
+        resp = client.run_report(request)
+        rows = []
+        for r in resp.rows:
+            rows.append({
+                "pagina": r.dimension_values[0].value,
+                "sessoes": int(float(r.metric_values[0].value)),
+                "sessoes_engajadas": int(float(r.metric_values[1].value)),
+                "taxa_engajamento": f"{float(r.metric_values[2].value)*100:.1f}%",
+                "duracao_media_seg": round(float(r.metric_values[3].value), 1),
+            })
+        return pd.DataFrame(rows)
+    except Exception as e:
+        print(f"  Erro ao buscar landing pages organicas: {e}")
+        return pd.DataFrame()
+
+
+def fetch_organic_by_device(client, start_date, end_date):
+    """Secao E: trafego organico por categoria de dispositivo (mobile/desktop/tablet)."""
+    if client is None:
+        return pd.DataFrame()
+    from google.analytics.data_v1beta.types import (
+        DateRange, Dimension, Metric, RunReportRequest, Filter, FilterExpression)
+    try:
+        request = RunReportRequest(
+            property=f"properties/{GA4_PROPERTY_ID}",
+            date_ranges=[DateRange(start_date=start_date.isoformat(),
+                                   end_date=end_date.isoformat())],
+            dimensions=[Dimension(name="deviceCategory")],
+            metrics=[Metric(name="sessions"), Metric(name="engagementRate")],
+            dimension_filter=FilterExpression(
+                filter=Filter(field_name="sessionDefaultChannelGroup",
+                             string_filter=Filter.StringFilter(value="Organic Search"))),
+        )
+        resp = client.run_report(request)
+        rows = []
+        for r in resp.rows:
+            rows.append({
+                "dispositivo": r.dimension_values[0].value,
+                "sessoes": int(float(r.metric_values[0].value)),
+                "taxa_engajamento": f"{float(r.metric_values[1].value)*100:.1f}%",
+            })
+        return pd.DataFrame(rows)
+    except Exception as e:
+        print(f"  Erro ao buscar trafego organico por dispositivo: {e}")
+        return pd.DataFrame()
+
+
+def fetch_organic_by_region(client, start_date, end_date):
+    """
+    Secao F: trafego organico por estado (region). Relevante porque a
+    TurFresh atua em varios estados especificos (city pages) - ver onde o
+    trafego organico de fato esta concentrado ajuda a cruzar com a
+    prioridade de mercado. Sem order_by na API (buscamos tudo e ordenamos
+    localmente, mesmo padrao ja usado no resto do script).
+    """
+    if client is None:
+        return pd.DataFrame()
+    from google.analytics.data_v1beta.types import (
+        DateRange, Dimension, Metric, RunReportRequest, Filter, FilterExpression)
+    try:
+        request = RunReportRequest(
+            property=f"properties/{GA4_PROPERTY_ID}",
+            date_ranges=[DateRange(start_date=start_date.isoformat(),
+                                   end_date=end_date.isoformat())],
+            dimensions=[Dimension(name="region")],
+            metrics=[Metric(name="sessions")],
+            dimension_filter=FilterExpression(
+                filter=Filter(field_name="sessionDefaultChannelGroup",
+                             string_filter=Filter.StringFilter(value="Organic Search"))),
+            limit=100000,
+        )
+        resp = client.run_report(request)
+        rows = []
+        for r in resp.rows:
+            rows.append({
+                "regiao": r.dimension_values[0].value,
+                "sessoes": int(float(r.metric_values[0].value)),
+            })
+        return pd.DataFrame(rows)
+    except Exception as e:
+        print(f"  Erro ao buscar trafego organico por regiao: {e}")
+        return pd.DataFrame()
+
+
 def _lead_source_sheet(wb, title, df_now, df_prev, group_col, label):
     """
-    Sheet dedicado do Lead Source, separado de _sheet() (que e feito para
-    as cores/colunas dos 9 gatilhos). Mesma formatacao visual (HEADER azul
-    ja definido acima), mas colunas proprias: pagina/campanha, evento,
-    leads da semana, leads da semana anterior, variacao.
+    Sheet dedicado dos leads (formulario/telefone/SMS), separado de _sheet()
+    (feito para as cores/colunas dos 9 gatilhos) e de _stats_sheet() (feito
+    para as metricas de trafego puro, sem coluna de evento).
     """
     ws = wb.create_sheet(title)
     cols = [("label", label, 45), ("evento", "Event", 34),
@@ -1937,7 +2100,7 @@ def _lead_source_sheet(wb, title, df_now, df_prev, group_col, label):
             rows.append({
                 "label": r[group_col], "evento": r["evento"],
                 "leads_semana": int(r["leads"]), "leads_semana_anterior": int(prev),
-                "variacao": _lead_variation(int(r["leads"]), int(prev)),
+                "variacao": _variation(int(r["leads"]), int(prev)),
             })
         rows.sort(key=lambda x: -x["leads_semana"])
 
@@ -1951,76 +2114,252 @@ def _lead_source_sheet(wb, title, df_now, df_prev, group_col, label):
     return rows
 
 
-def build_lead_source_report(organic_now, organic_prev, cta_now, cta_prev, run_date,
-                              path="turfresh_lead_source.xlsx"):
+def _stats_sheet(wb, title, df_now, df_prev, group_col, label, extra_metric_cols,
+                 sort_key="sessoes"):
+    """
+    Sheet generico para as tabelas de trafego GA4 (landing pages,
+    dispositivo, regiao, posts de blog). Sempre mostra sessoes com variacao
+    vs semana anterior (mesmo padrao do resto do relatorio); as demais
+    metricas (engajamento, duracao) aparecem so da semana atual, sem
+    comparativo - isso evita inflar o numero de colunas por pouco ganho
+    pratico.
+
+    extra_metric_cols: lista de (coluna_no_df, cabecalho, largura) para as
+    metricas extras alem de sessoes.
+    sort_key: por qual coluna ordenar as linhas (desc). Default 'sessoes'
+    (volume de trafego). Para rankear por engajamento em vez de volume
+    (ex: posts de blog), usar 'sessoes_engajadas' - essa coluna precisa
+    estar tambem em extra_metric_cols para aparecer na planilha.
+    """
+    ws = wb.create_sheet(title)
+    cols = ([("label", label, 42), ("sessoes", "Sessions this week", 15),
+            ("sessoes_semana_anterior", "Sessions prev week", 15),
+            ("variacao", "Change", 10)]
+            + [(k, h, w) for k, h, w in extra_metric_cols])
+    for i, (key, h, w) in enumerate(cols, 1):
+        c = ws.cell(1, i, h)
+        c.font = Font(bold=True, color="FFFFFF", size=10)
+        c.fill = HEADER
+        c.alignment = Alignment(vertical="center", horizontal="center", wrap_text=True)
+        ws.column_dimensions[get_column_letter(i)].width = w
+    ws.row_dimensions[1].height = 22
+
+    rows = []
+    if not df_now.empty:
+        prev_map = {}
+        if not df_prev.empty:
+            for _, r in df_prev.iterrows():
+                prev_map[r[group_col]] = r["sessoes"]
+        for _, r in df_now.iterrows():
+            prev = prev_map.get(r[group_col], 0)
+            row = {"label": r[group_col], "sessoes": int(r["sessoes"]),
+                   "sessoes_semana_anterior": int(prev),
+                   "variacao": _variation(int(r["sessoes"]), int(prev))}
+            for k, _, _ in extra_metric_cols:
+                row[k] = r.get(k, "")
+            rows.append(row)
+        rows.sort(key=lambda x: -(x[sort_key] if isinstance(x.get(sort_key), (int, float)) else 0))
+
+    for ri, row in enumerate(rows, 2):
+        for ci, (key, _, _) in enumerate(cols, 1):
+            cell = ws.cell(ri, ci, row.get(key, ""))
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+    ws.freeze_panes = "A2"
+    if rows:
+        ws.auto_filter.ref = f"A1:{get_column_letter(len(cols))}{len(rows)+1}"
+    return rows
+
+
+def _filter_blog_posts(df):
+    """
+    Filtra as landing pages organicas para so os posts de blog (path
+    comeca com /blog/), separando post editorial de city page, homepage,
+    /contact/, /careers/, etc. Reusa o dataframe que fetch_organic_landing_
+    pages ja trouxe - nao precisa de outra chamada a API.
+    """
+    if df.empty or "pagina" not in df.columns:
+        return df
+    return df[df["pagina"].str.startswith("/blog/")].reset_index(drop=True)
+
+
+def build_ga4_seo_report(traffic_now, traffic_prev, landing_now, landing_prev,
+                          device_now, device_prev, region_now, region_prev,
+                          organic_leads_now, organic_leads_prev,
+                          cta_leads_now, cta_leads_prev, run_date,
+                          path="turfresh_ga4_seo.xlsx"):
+    """
+    Relatorio ampliado (pedido do Rafael: 'puxar tudo que for pertinente de
+    SEO do GA4'). Sheets: Summary (numeros gerais), Landing Pages, Device,
+    Region, Leads - Organic Search, Leads - CTA Banner. Continua sendo o
+    relatorio separado da auditoria de GSC, so que agora e o conteudo
+    principal do e-mail semanal, nao mais um complemento.
+    """
     wb = Workbook()
     ws = wb.active
     ws.title = "Summary"
-    ws["A1"] = f"TurFresh - Lead Source (SEO) - {run_date.isoformat()}"
+    ws["A1"] = f"TurFresh - GA4 SEO Report - {run_date.isoformat()}"
     ws["A1"].font = Font(bold=True, size=14)
-    total_organic = int(organic_now["leads"].sum()) if not organic_now.empty else 0
-    total_cta = int(cta_now["leads"].sum()) if not cta_now.empty else 0
-    ws["A3"] = f"Leads via Organic Search (all landing pages): {total_organic}"
-    ws["A4"] = f"Leads via Blog CTA banner: {total_cta}"
-    ws.column_dimensions["A"].width = 55
 
-    organic_rows = _lead_source_sheet(wb, "Organic Search", organic_now, organic_prev,
-                                      "pagina", "Landing page")
-    cta_rows = _lead_source_sheet(wb, "CTA Banner", cta_now, cta_prev,
-                                  "campanha_post", "Blog post (campaign)")
+    row_n = 3
+    if traffic_now:
+        sessions_var = _variation(traffic_now.get("sessions", 0), traffic_prev.get("sessions", 0))
+        users_var = _variation(traffic_now.get("users", 0), traffic_prev.get("users", 0))
+        ws[f"A{row_n}"] = f"Organic sessions: {traffic_now.get('sessions', 0)} ({sessions_var} vs last week)"
+        row_n += 1
+        ws[f"A{row_n}"] = f"Organic users: {traffic_now.get('users', 0)} ({users_var} vs last week)"
+        row_n += 1
+        ws[f"A{row_n}"] = f"Organic engagement rate: {traffic_now.get('engagement_rate', 0)*100:.1f}%"
+        row_n += 1
+        ws[f"A{row_n}"] = f"Organic avg session duration: {traffic_now.get('avg_duration_sec', 0):.0f}s"
+        row_n += 1
+    else:
+        ws[f"A{row_n}"] = "Organic traffic: no data this week."
+        row_n += 1
+    row_n += 1
+
+    total_organic_leads = int(organic_leads_now["leads"].sum()) if not organic_leads_now.empty else 0
+    total_cta_leads = int(cta_leads_now["leads"].sum()) if not cta_leads_now.empty else 0
+    ws[f"A{row_n}"] = f"Leads via Organic Search (all landing pages): {total_organic_leads}"
+    row_n += 1
+    ws[f"A{row_n}"] = f"Leads via Blog CTA banner: {total_cta_leads}"
+    row_n += 1
+    ws.column_dimensions["A"].width = 60
+
+    landing_rows = _stats_sheet(wb, "Landing Pages (Organic)", landing_now, landing_prev,
+                                "pagina", "Landing page",
+                                [("taxa_engajamento", "Engagement rate", 14),
+                                 ("duracao_media_seg", "Avg duration (s)", 15)])
+
+    blog_now = _filter_blog_posts(landing_now)
+    blog_prev = _filter_blog_posts(landing_prev)
+    blog_rows = _stats_sheet(wb, "Blog Posts (Engagement)", blog_now, blog_prev,
+                             "pagina", "Blog post",
+                             [("sessoes_engajadas", "Engaged sessions", 16),
+                              ("taxa_engajamento", "Engagement rate", 14),
+                              ("duracao_media_seg", "Avg duration (s)", 15)],
+                             sort_key="sessoes_engajadas")
+
+    device_rows = _stats_sheet(wb, "Device (Organic)", device_now, device_prev,
+                               "dispositivo", "Device",
+                               [("taxa_engajamento", "Engagement rate", 14)])
+    region_rows = _stats_sheet(wb, "Region (Organic)", region_now, region_prev,
+                               "regiao", "State/Region", [])
+
+    organic_lead_rows = _lead_source_sheet(wb, "Leads - Organic Search", organic_leads_now,
+                                           organic_leads_prev, "pagina", "Landing page")
+    cta_lead_rows = _lead_source_sheet(wb, "Leads - CTA Banner", cta_leads_now,
+                                       cta_leads_prev, "campanha_post", "Blog post (campaign)")
 
     wb.save(path)
-    return path, organic_rows, cta_rows
+    tables = {
+        "landing": landing_rows, "blog_posts": blog_rows, "device": device_rows,
+        "region": region_rows,
+        "organic_leads": organic_lead_rows, "cta_leads": cta_lead_rows,
+    }
+    return path, tables
 
 
-def send_lead_source_email(organic_rows, cta_rows, report_path, run_date):
+def send_ga4_seo_email(traffic_now, traffic_prev, tables, report_path, run_date):
     import smtplib
     from email.message import EmailMessage
 
-    top_organic = organic_rows[:MAX_ITEMS_PER_SECTION]
-    top_cta = cta_rows[:MAX_ITEMS_PER_SECTION]
+    def _fmt_change(now_val, prev_val):
+        return _variation(int(now_val), int(prev_val or 0))
+
+    def _top_list_html(html, title, rows, value_key="sessoes", suffix="session(s)"):
+        html.append(f'<h3 style="color:#1F3864;margin-bottom:6px;">{title}</h3>')
+        top = rows[:MAX_ITEMS_PER_SECTION]
+        if not top:
+            html.append('<p style="color:#555;">No data this week.</p>')
+            return
+        html.append('<ul style="padding-left:18px;margin-top:4px;">')
+        for r in top:
+            html.append(f'<li><b>{r[value_key]}</b> {suffix} ({r["variacao"]} vs last week) - '
+                       f'{_html_escape(r["label"])}</li>')
+        html.append('</ul>')
+
+    def _leads_list_html(html, title, rows):
+        html.append(f'<h3 style="color:#1F3864;margin-bottom:6px;">{title}</h3>')
+        top = rows[:MAX_ITEMS_PER_SECTION]
+        if not top:
+            html.append('<p style="color:#555;">No leads this week.</p>')
+            return
+        html.append('<ul style="padding-left:18px;margin-top:4px;">')
+        for r in top:
+            html.append(f'<li><b>{r["leads_semana"]}</b> lead(s) ({r["variacao"]} vs last week) '
+                       f'- {_html_escape(r["label"])} '
+                       f'<span style="color:#888;">[{_html_escape(r["evento"])}]</span></li>')
+        html.append('</ul>')
 
     html = ['<div style="font-family:Arial,Helvetica,sans-serif;max-width:720px;">']
-    html.append('<h2 style="color:#1F3864;margin-bottom:4px;">TurFresh - Lead Source (SEO)</h2>')
+    html.append('<h2 style="color:#1F3864;margin-bottom:4px;">TurFresh - GA4 SEO Report</h2>')
     html.append(f'<p style="color:#666;margin-top:0;">{run_date.isoformat()}</p>')
 
-    html.append('<h3 style="color:#1F3864;margin-bottom:6px;">Organic Search - top landing pages</h3>')
-    if not top_organic:
-        html.append('<p style="color:#555;">No organic leads this week.</p>')
+    html.append('<h3 style="color:#1F3864;margin-bottom:6px;">Organic Search - traffic summary</h3>')
+    if not traffic_now:
+        html.append('<p style="color:#555;">No organic traffic data this week.</p>')
     else:
         html.append('<ul style="padding-left:18px;margin-top:4px;">')
-        for r in top_organic:
-            html.append(f'<li><b>{r["leads_semana"]}</b> lead(s) ({r["variacao"]} vs last week) '
-                       f'- {_html_escape(r["label"])} '
-                       f'<span style="color:#888;">[{_html_escape(r["evento"])}]</span></li>')
+        html.append(f'<li><b>{traffic_now.get("sessions", 0)}</b> sessions '
+                   f'({_fmt_change(traffic_now.get("sessions", 0), traffic_prev.get("sessions", 0))} '
+                   f'vs last week)</li>')
+        html.append(f'<li><b>{traffic_now.get("users", 0)}</b> users '
+                   f'({_fmt_change(traffic_now.get("users", 0), traffic_prev.get("users", 0))} '
+                   f'vs last week)</li>')
+        html.append(f'<li>{traffic_now.get("engagement_rate", 0)*100:.1f}% engagement rate</li>')
+        html.append(f'<li>{traffic_now.get("avg_duration_sec", 0):.0f}s average session duration</li>')
         html.append('</ul>')
 
-    html.append('<h3 style="color:#1F3864;margin-bottom:6px;">Blog CTA banner - top posts</h3>')
-    if not top_cta:
-        html.append('<p style="color:#555;">No CTA banner leads this week.</p>')
-    else:
-        html.append('<ul style="padding-left:18px;margin-top:4px;">')
-        for r in top_cta:
-            html.append(f'<li><b>{r["leads_semana"]}</b> lead(s) ({r["variacao"]} vs last week) '
-                       f'- {_html_escape(r["label"])} '
-                       f'<span style="color:#888;">[{_html_escape(r["evento"])}]</span></li>')
-        html.append('</ul>')
+    _top_list_html(html, "Top organic landing pages (traffic)", tables["landing"])
+    _top_list_html(html, "Top blog posts by engagement", tables["blog_posts"],
+                   value_key="sessoes_engajadas", suffix="engaged session(s)")
+    _top_list_html(html, "Organic traffic by device", tables["device"])
+    _top_list_html(html, "Organic traffic by state", tables["region"])
+    _leads_list_html(html, "Leads - Organic Search", tables["organic_leads"])
+    _leads_list_html(html, "Leads - Blog CTA banner", tables["cta_leads"])
 
     html.append('<p style="color:#666;font-size:12px;">Full breakdown, including week-over-week '
-               'change for every page and post, in the attached spreadsheet.</p>')
+               'change for every page, device, state, and lead source, in the attached '
+               'spreadsheet.</p>')
     html.append('</div>')
     html_str = "\n".join(html)
 
-    text_lines = [f"TurFresh - Lead Source (SEO) - {run_date.isoformat()}", "", "Top organic landing pages:"]
-    if not top_organic:
+    text_lines = [f"TurFresh - GA4 SEO Report - {run_date.isoformat()}", ""]
+    text_lines.append("Traffic summary:")
+    if traffic_now:
+        text_lines.append(f"  {traffic_now.get('sessions', 0)} sessions "
+                         f"({_fmt_change(traffic_now.get('sessions', 0), traffic_prev.get('sessions', 0))})")
+        text_lines.append(f"  {traffic_now.get('users', 0)} users "
+                         f"({_fmt_change(traffic_now.get('users', 0), traffic_prev.get('users', 0))})")
+        text_lines.append(f"  {traffic_now.get('engagement_rate', 0)*100:.1f}% engagement rate")
+    else:
+        text_lines.append("  No organic traffic data this week.")
+    text_lines.append("")
+
+    def _text_list(title, rows, value_key="sessoes"):
+        text_lines.append(f"{title}:")
+        top = rows[:MAX_ITEMS_PER_SECTION]
+        if not top:
+            text_lines.append("  No data this week.")
+        for r in top:
+            text_lines.append(f"  {r[value_key]} ({r['variacao']}) - {r['label']}")
+        text_lines.append("")
+
+    _text_list("Top organic landing pages", tables["landing"])
+    _text_list("Top blog posts by engagement", tables["blog_posts"], value_key="sessoes_engajadas")
+    _text_list("Organic traffic by device", tables["device"])
+    _text_list("Organic traffic by state", tables["region"])
+
+    text_lines.append("Leads - Organic Search:")
+    if not tables["organic_leads"]:
         text_lines.append("  No organic leads this week.")
-    for r in top_organic:
+    for r in tables["organic_leads"][:MAX_ITEMS_PER_SECTION]:
         text_lines.append(f"  {r['leads_semana']} ({r['variacao']}) - {r['label']} [{r['evento']}]")
     text_lines.append("")
-    text_lines.append("Top CTA banner posts:")
-    if not top_cta:
+    text_lines.append("Leads - Blog CTA banner:")
+    if not tables["cta_leads"]:
         text_lines.append("  No CTA banner leads this week.")
-    for r in top_cta:
+    for r in tables["cta_leads"][:MAX_ITEMS_PER_SECTION]:
         text_lines.append(f"  {r['leads_semana']} ({r['variacao']}) - {r['label']} [{r['evento']}]")
     text = "\n".join(text_lines)
 
@@ -2029,7 +2368,7 @@ def send_lead_source_email(organic_rows, cta_rows, report_path, run_date):
         return
 
     msg = EmailMessage()
-    msg["Subject"] = f"[TurFresh] Lead Source (SEO) - {run_date.isoformat()}"
+    msg["Subject"] = f"[TurFresh] GA4 SEO Report - {run_date.isoformat()}"
     msg["From"] = GMAIL_USER
     msg["To"] = ALERT_EMAIL_TO
     msg.set_content(text)
@@ -2037,11 +2376,11 @@ def send_lead_source_email(organic_rows, cta_rows, report_path, run_date):
     with open(report_path, "rb") as f:
         msg.add_attachment(f.read(), maintype="application",
                            subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                           filename=f"turfresh-lead-source-{run_date.isoformat()}.xlsx")
+                           filename=f"turfresh-ga4-seo-{run_date.isoformat()}.xlsx")
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
         s.login(GMAIL_USER, GMAIL_APP_PASSWORD)
         s.send_message(msg)
-    print("Email enviado (Lead Source).")
+    print("Email enviado (GA4 SEO Report).")
     print(text)
 
 
@@ -2108,16 +2447,27 @@ def main():
 
     send_email(g1, g2, g3, g4, g5, g6, g7, g8, g9, systemic, report_path, run_date)
 
-    print("Gerando relatorio de Lead Source (SEO)...")
-    organic_now = fetch_organic_leads_by_page(ga4_client, cur_start, cur_end)
-    organic_prev = fetch_organic_leads_by_page(ga4_client, prev_start, prev_end)
+    print("Gerando relatorio de GA4 SEO (trafego + leads)...")
+    traffic_now = fetch_organic_traffic_summary(ga4_client, cur_start, cur_end)
+    traffic_prev = fetch_organic_traffic_summary(ga4_client, prev_start, prev_end)
+    landing_now = fetch_organic_landing_pages(ga4_client, cur_start, cur_end)
+    landing_prev = fetch_organic_landing_pages(ga4_client, prev_start, prev_end)
+    device_now = fetch_organic_by_device(ga4_client, cur_start, cur_end)
+    device_prev = fetch_organic_by_device(ga4_client, prev_start, prev_end)
+    region_now = fetch_organic_by_region(ga4_client, cur_start, cur_end)
+    region_prev = fetch_organic_by_region(ga4_client, prev_start, prev_end)
+    organic_leads_now = fetch_organic_leads_by_page(ga4_client, cur_start, cur_end)
+    organic_leads_prev = fetch_organic_leads_by_page(ga4_client, prev_start, prev_end)
     cta_leads_now = fetch_cta_banner_leads(ga4_client, cur_start, cur_end)
     cta_leads_prev = fetch_cta_banner_leads(ga4_client, prev_start, prev_end)
-    lead_report_path, organic_rows, cta_lead_rows = build_lead_source_report(
-        organic_now, organic_prev, cta_leads_now, cta_leads_prev, run_date)
-    print(f"  Relatorio: {lead_report_path}\n")
 
-    send_lead_source_email(organic_rows, cta_lead_rows, lead_report_path, run_date)
+    ga4_report_path, ga4_tables = build_ga4_seo_report(
+        traffic_now, traffic_prev, landing_now, landing_prev,
+        device_now, device_prev, region_now, region_prev,
+        organic_leads_now, organic_leads_prev, cta_leads_now, cta_leads_prev, run_date)
+    print(f"  Relatorio: {ga4_report_path}\n")
+
+    send_ga4_seo_email(traffic_now, traffic_prev, ga4_tables, ga4_report_path, run_date)
 
 
 if __name__ == "__main__":
