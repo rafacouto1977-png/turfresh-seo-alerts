@@ -1327,6 +1327,13 @@ ALERT_EMAIL_TO = os.environ.get("ALERT_EMAIL_TO")
 GA4_PROPERTY_ID = os.environ.get("GA4_PROPERTY_ID", "")
 CTA_UTM_MEDIUM = "cta_banner"
 
+# GA4 nao precisa da mesma margem de 3 dias do GSC - o dado dele costuma
+# ficar maduro em menos de 24h. Usar o lag do GSC aqui fazia o GA4 mostrar
+# uma semana inteira "atrasada" sem necessidade (ex: rodando numa segunda,
+# o GSC precisa recuar ate a semana retrasada, mas o GA4 ja teria a semana
+# que acabou de terminar disponivel). Janela calculada separada abaixo.
+GA4_LAG_DAYS = 1
+
 # --- Lead Source Report (SEO) ---
 # Reusa a mesma conta de servico/propriedade GA4 do Gatilho 8 (nenhum
 # secret novo). Roda dentro do mesmo main(), gera uma planilha e um e-mail
@@ -2186,6 +2193,7 @@ def build_ga4_seo_report(traffic_now, traffic_prev, landing_now, landing_prev,
                           device_now, device_prev, region_now, region_prev,
                           organic_leads_now, organic_leads_prev,
                           cta_leads_now, cta_leads_prev, run_date,
+                          week_start=None, week_end=None,
                           path="turfresh_ga4_seo.xlsx"):
     """
     Relatorio ampliado (pedido do Rafael: 'puxar tudo que for pertinente de
@@ -2193,6 +2201,10 @@ def build_ga4_seo_report(traffic_now, traffic_prev, landing_now, landing_prev,
     Region, Leads - Organic Search, Leads - CTA Banner. Continua sendo o
     relatorio separado da auditoria de GSC, so que agora e o conteudo
     principal do e-mail semanal, nao mais um complemento.
+
+    week_start/week_end: a janela real coberta pelos dados do GA4 (lag
+    proprio de 1 dia, diferente da janela do GSC) - mostrado explicitamente
+    porque agora os dois relatorios podem cobrir semanas diferentes.
     """
     wb = Workbook()
     ws = wb.active
@@ -2201,6 +2213,10 @@ def build_ga4_seo_report(traffic_now, traffic_prev, landing_now, landing_prev,
     ws["A1"].font = Font(bold=True, size=14)
 
     row_n = 3
+    if week_start and week_end:
+        ws[f"A{row_n}"] = f"Week covered: {week_start.isoformat()} to {week_end.isoformat()}"
+        ws[f"A{row_n}"].font = Font(italic=True, color="666666")
+        row_n += 2
     if traffic_now:
         sessions_var = _variation(traffic_now.get("sessions", 0), traffic_prev.get("sessions", 0))
         users_var = _variation(traffic_now.get("users", 0), traffic_prev.get("users", 0))
@@ -2259,7 +2275,8 @@ def build_ga4_seo_report(traffic_now, traffic_prev, landing_now, landing_prev,
     return path, tables
 
 
-def send_ga4_seo_email(traffic_now, traffic_prev, tables, report_path, run_date):
+def send_ga4_seo_email(traffic_now, traffic_prev, tables, report_path, run_date,
+                       week_start=None, week_end=None):
     import smtplib
     from email.message import EmailMessage
 
@@ -2294,6 +2311,9 @@ def send_ga4_seo_email(traffic_now, traffic_prev, tables, report_path, run_date)
     html = ['<div style="font-family:Arial,Helvetica,sans-serif;max-width:720px;">']
     html.append('<h2 style="color:#1F3864;margin-bottom:4px;">TurFresh - GA4 SEO Report</h2>')
     html.append(f'<p style="color:#666;margin-top:0;">{run_date.isoformat()}</p>')
+    if week_start and week_end:
+        html.append(f'<p style="color:#888;font-size:12px;margin-top:-6px;">'
+                   f'Week covered: {week_start.isoformat()} to {week_end.isoformat()}</p>')
 
     html.append('<h3 style="color:#1F3864;margin-bottom:6px;">Organic Search - traffic summary</h3>')
     if not traffic_now:
@@ -2324,7 +2344,10 @@ def send_ga4_seo_email(traffic_now, traffic_prev, tables, report_path, run_date)
     html.append('</div>')
     html_str = "\n".join(html)
 
-    text_lines = [f"TurFresh - GA4 SEO Report - {run_date.isoformat()}", ""]
+    text_lines = [f"TurFresh - GA4 SEO Report - {run_date.isoformat()}"]
+    if week_start and week_end:
+        text_lines.append(f"Week covered: {week_start.isoformat()} to {week_end.isoformat()}")
+    text_lines.append("")
     text_lines.append("Traffic summary:")
     if traffic_now:
         text_lines.append(f"  {traffic_now.get('sessions', 0)} sessions "
@@ -2435,10 +2458,14 @@ def main():
 
     print("Buscando dados de CTA banner (GA4)...")
     ga4_client = get_ga4_client()
-    cur_start, cur_end = windows[-1]
-    prev_start, prev_end = windows[-2]
-    current_cta = fetch_cta_banner_by_campaign(ga4_client, cur_start, cur_end)
-    previous_cta = fetch_cta_banner_by_campaign(ga4_client, prev_start, prev_end)
+    ga4_cur_end = _most_recent_complete_week_end(run_date, GA4_LAG_DAYS)
+    ga4_cur_start = ga4_cur_end - timedelta(days=6)
+    ga4_prev_end = ga4_cur_end - timedelta(days=7)
+    ga4_prev_start = ga4_prev_end - timedelta(days=6)
+    print(f"  Semana GA4: {ga4_cur_start} a {ga4_cur_end} "
+          f"(lag de {GA4_LAG_DAYS} dia - pode ser mais recente que a janela do GSC acima)\n")
+    current_cta = fetch_cta_banner_by_campaign(ga4_client, ga4_cur_start, ga4_cur_end)
+    previous_cta = fetch_cta_banner_by_campaign(ga4_client, ga4_prev_start, ga4_prev_end)
     g8 = gatilho_8_cta_banner(current_cta, previous_cta)
     print(f"  G8 CTA banner: {len(g8)} campanhas com dado\n")
 
@@ -2448,26 +2475,28 @@ def main():
     send_email(g1, g2, g3, g4, g5, g6, g7, g8, g9, systemic, report_path, run_date)
 
     print("Gerando relatorio de GA4 SEO (trafego + leads)...")
-    traffic_now = fetch_organic_traffic_summary(ga4_client, cur_start, cur_end)
-    traffic_prev = fetch_organic_traffic_summary(ga4_client, prev_start, prev_end)
-    landing_now = fetch_organic_landing_pages(ga4_client, cur_start, cur_end)
-    landing_prev = fetch_organic_landing_pages(ga4_client, prev_start, prev_end)
-    device_now = fetch_organic_by_device(ga4_client, cur_start, cur_end)
-    device_prev = fetch_organic_by_device(ga4_client, prev_start, prev_end)
-    region_now = fetch_organic_by_region(ga4_client, cur_start, cur_end)
-    region_prev = fetch_organic_by_region(ga4_client, prev_start, prev_end)
-    organic_leads_now = fetch_organic_leads_by_page(ga4_client, cur_start, cur_end)
-    organic_leads_prev = fetch_organic_leads_by_page(ga4_client, prev_start, prev_end)
-    cta_leads_now = fetch_cta_banner_leads(ga4_client, cur_start, cur_end)
-    cta_leads_prev = fetch_cta_banner_leads(ga4_client, prev_start, prev_end)
+    traffic_now = fetch_organic_traffic_summary(ga4_client, ga4_cur_start, ga4_cur_end)
+    traffic_prev = fetch_organic_traffic_summary(ga4_client, ga4_prev_start, ga4_prev_end)
+    landing_now = fetch_organic_landing_pages(ga4_client, ga4_cur_start, ga4_cur_end)
+    landing_prev = fetch_organic_landing_pages(ga4_client, ga4_prev_start, ga4_prev_end)
+    device_now = fetch_organic_by_device(ga4_client, ga4_cur_start, ga4_cur_end)
+    device_prev = fetch_organic_by_device(ga4_client, ga4_prev_start, ga4_prev_end)
+    region_now = fetch_organic_by_region(ga4_client, ga4_cur_start, ga4_cur_end)
+    region_prev = fetch_organic_by_region(ga4_client, ga4_prev_start, ga4_prev_end)
+    organic_leads_now = fetch_organic_leads_by_page(ga4_client, ga4_cur_start, ga4_cur_end)
+    organic_leads_prev = fetch_organic_leads_by_page(ga4_client, ga4_prev_start, ga4_prev_end)
+    cta_leads_now = fetch_cta_banner_leads(ga4_client, ga4_cur_start, ga4_cur_end)
+    cta_leads_prev = fetch_cta_banner_leads(ga4_client, ga4_prev_start, ga4_prev_end)
 
     ga4_report_path, ga4_tables = build_ga4_seo_report(
         traffic_now, traffic_prev, landing_now, landing_prev,
         device_now, device_prev, region_now, region_prev,
-        organic_leads_now, organic_leads_prev, cta_leads_now, cta_leads_prev, run_date)
+        organic_leads_now, organic_leads_prev, cta_leads_now, cta_leads_prev, run_date,
+        week_start=ga4_cur_start, week_end=ga4_cur_end)
     print(f"  Relatorio: {ga4_report_path}\n")
 
-    send_ga4_seo_email(traffic_now, traffic_prev, ga4_tables, ga4_report_path, run_date)
+    send_ga4_seo_email(traffic_now, traffic_prev, ga4_tables, ga4_report_path, run_date,
+                       week_start=ga4_cur_start, week_end=ga4_cur_end)
 
 
 if __name__ == "__main__":
