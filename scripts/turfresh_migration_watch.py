@@ -15,13 +15,16 @@ no ClickUp).
 
 Dois sinais, nada mais:
 
-1. INDEXACAO (via API de Sitemaps, mesmo client GSC de sempre). Estrutural:
-   uma queda no numero de paginas indexadas nao precisa de "confirmacao em
-   dias seguidos" como trafego - indexacao nao oscila por ruido do jeito
-   que cliques oscilam. Isto e um PROXY, nao o Relatorio de Indexacao de
-   Paginas em si (esse relatorio nao tem endpoint na API) - ajuda a pegar
-   quedas estruturais sem esperar a revisao manual diaria, mas nao
-   substitui ela.
+1. SITEMAP (via API de Sitemaps, mesmo client GSC de sempre). Rastreamos o
+   numero de paginas SUBMETIDAS no sitemap (o "Discovered pages" que
+   aparece em Search Console > Sitemaps) - nao "indexadas". O campo
+   'indexed' da API praticamente nao vem mais preenchido; o proprio Search
+   Console tirou essa coluna do relatorio ha um tempo. Uma queda nesse
+   numero ainda e estrutural (paginas saindo do sitemap) e nao precisa de
+   "confirmacao em dias seguidos" como trafego - isto e um PROXY, nao o
+   Relatorio de Indexacao de Paginas em si (esse nao tem endpoint na API),
+   ajuda a pegar quedas estruturais sem esperar a revisao manual diaria,
+   mas nao substitui ela.
 
 2. TRAFEGO AGREGADO DO SITE (cliques/impressoes por dia, sem quebrar por
    query/pagina), comparado contra a media do MESMO DIA DA SEMANA no
@@ -44,7 +47,7 @@ imediato para quedas obvias):
     Rafael definiu como "sinal real" no brief da migracao - so exige dois
     dias seguidos antes de mandar, porque um dia so nessa faixa ainda pode
     ser oscilacao normal.
-  - indexacao caiu (qualquer valor, 1 dia basta): sempre e-mail.
+  - numero de paginas no sitemap caiu (qualquer valor, 1 dia basta): sempre e-mail.
 
 Silencio proposital fora desses casos: rodando todo dia, mandar e-mail
 mesmo sem nada para reportar viraria ruido em poucas semanas. Sem e-mail
@@ -174,23 +177,32 @@ def evaluate_traffic_drop(day, day_data, baseline):
     }
 
 
-def check_indexed_pages(service, state):
+def check_sitemap_pages(service, state):
     """
     Usa a API de Sitemaps (mesmo service da Search Console) para somar
-    paginas indexadas em todos os sitemaps submetidos, incluindo os filhos
-    de um sitemap index (padrao do Rank Math: sitemap_index.xml apontando
-    para page-sitemap.xml, post-sitemap.xml etc). Isto e um PROXY do
-    Relatorio de Indexacao de Paginas, nao o relatorio em si - atualiza mais
-    devagar, porque o Google so reprocessa o sitemap de tempos em tempos.
-    Por isso so alerta em QUEDA; nunca conclui "tudo ok" so por estabilidade.
+    paginas SUBMETIDAS em todos os sitemaps, incluindo os filhos de um
+    sitemap index (padrao do Rank Math: sitemap_index.xml apontando para
+    page-sitemap.xml, post-sitemap.xml etc). Esse e o mesmo numero que
+    aparece como "Discovered pages" em Search Console > Sitemaps.
+
+    Deliberadamente NAO usamos o campo 'indexed' da mesma resposta: na
+    pratica ele vem zerado (confirmado rodando contra o site real - 0 de
+    indexed com 524 de submitted, batendo exatamente com o "Discovered
+    pages: 524" do Search Console) porque o Google parou de preencher esse
+    campo granular ha um tempo; o proprio relatorio de Sitemaps no Search
+    Console nao mostra mais essa coluna. "Submetidas" e um proxy mais fraco
+    que "indexadas de verdade", mas e o unico numero que a API ainda
+    devolve de forma confiavel - uma queda nele ainda sinaliza algo
+    estrutural (paginas caindo do sitemap), so nao pega o caso de a pagina
+    continuar no sitemap mas o Google decidir nao indexar - para isso, so
+    o Relatorio de Indexacao de Paginas revisado a mao mesmo.
     """
     try:
         resp = service.sitemaps().list(siteUrl=SITE_URL).execute()
     except Exception as e:
-        print(f"  Aviso: nao foi possivel ler sitemaps ({e}) - pulando checagem de indexacao.")
+        print(f"  Aviso: nao foi possivel ler sitemaps ({e}) - pulando checagem de sitemap.")
         return None
 
-    total_indexed = 0
     total_submitted = 0
     found_any_contents = False
 
@@ -207,18 +219,16 @@ def check_indexed_pages(service, state):
         for sub in sub_entries:
             for c in sub.get("contents", []):
                 found_any_contents = True
-                total_indexed += int(c.get("indexed", 0))
                 total_submitted += int(c.get("submitted", 0))
 
     if not found_any_contents:
         print("  Aviso: sitemaps sem dado de 'contents' ainda (comum logo apos migracao) - pulando comparacao.")
         return None
 
-    previous = state.get("last_indexed_count")
-    result = {"indexed_now": total_indexed, "submitted_now": total_submitted,
-              "indexed_previous": previous,
-              "dropped": previous is not None and total_indexed < previous}
-    state["last_indexed_count"] = total_indexed
+    previous = state.get("last_submitted_count")
+    result = {"submitted_now": total_submitted, "submitted_previous": previous,
+              "dropped": previous is not None and total_submitted < previous}
+    state["last_submitted_count"] = total_submitted
     return result
 
 
@@ -323,21 +333,21 @@ def main():
     state["consecutive_severe_days"] = streak
     state["last_check_date"] = day.isoformat()
 
-    print("Checando indexacao via sitemaps...")
-    index_check = check_indexed_pages(service, state)
+    print("Checando sitemap...")
+    index_check = check_sitemap_pages(service, state)
     if index_check:
-        print(f"  Indexadas agora: {index_check['indexed_now']} "
-              f"(execucao anterior: {index_check['indexed_previous']})\n")
+        print(f"  Paginas no sitemap agora: {index_check['submitted_now']} "
+              f"(execucao anterior: {index_check['submitted_previous']})\n")
 
     alerts = []
 
     if index_check and index_check["dropped"]:
         alerts.append({
-            "subject": "Indexed pages dropped",
-            "body": (f"Sitemap-reported indexed pages dropped from "
-                    f"{index_check['indexed_previous']} to {index_check['indexed_now']}. "
-                    f"This is a structural signal, not daily traffic noise - check the "
-                    f"Page Indexing report in GSC today."),
+            "subject": "Sitemap page count dropped",
+            "body": (f"Sitemap-submitted page count dropped from "
+                    f"{index_check['submitted_previous']} to {index_check['submitted_now']}. "
+                    f"This is a structural signal, not daily traffic noise - check Search "
+                    f"Console > Sitemaps and the Page Indexing report today."),
         })
 
     if traffic:
