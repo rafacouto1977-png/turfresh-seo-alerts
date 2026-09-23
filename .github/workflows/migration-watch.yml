@@ -1,0 +1,47 @@
+name: TurFresh Migration Watch (Daily)
+
+# Watch intensivo para os 30 dias pos-migracao (23/set a 23/out/2026).
+# Depois disso: apagar este workflow, ou trocar o cron para semanal
+# acompanhando a comparacao de 30-90 dias que ja esta no ClickUp.
+
+on:
+  schedule:
+    - cron: "0 9 * * *"   # 06:00 Brasilia (UTC-3), todo dia
+  workflow_dispatch: {}    # permite rodar manualmente pela aba Actions
+
+permissions:
+  contents: write   # necessario para commitar o estado do streak de dias com queda
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install google-auth google-api-python-client
+
+      - name: Run migration watch
+        env:
+          GSC_CLIENT_EMAIL: ${{ secrets.GSC_CLIENT_EMAIL }}
+          GSC_PRIVATE_KEY: ${{ secrets.GSC_PRIVATE_KEY }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+        run: python scripts/turfresh_migration_watch.py
+
+      - name: Commit updated state (if changed)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if ! git diff --quiet -- data/migration_watch_state.json; then
+            git add data/migration_watch_state.json
+            git commit -m "Update migration watch state [skip ci]"
+            git push
+          else
+            echo "Sem mudanca no estado, nada para commitar."
+          fi
